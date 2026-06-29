@@ -2148,6 +2148,10 @@ function hostOnClose(conn) {
 function allPlayersReady() {
   return net.players.every(p => p.faction === 0 || p.ready);
 }
+// host may only START with at least one joined player AND everyone readied
+function canStartMatch() {
+  return net.players.length >= 2 && allPlayersReady();
+}
 
 function netStartHost() {
   if (net.role !== "host") return;
@@ -3589,8 +3593,9 @@ function drawLobby() {
 
     const bw = pw * 0.40, bh = 34 * S, gap = pw * 0.04, byy = y0 + ph - 46 * S;
     if (net.role === "host") {
+      const canStart = canStartMatch();   // dim START until a joiner has readied
       lobbyUI.start = { x: cx - bw - gap / 2, y: byy, w: bw, h: bh };
-      drawBtn(lobbyUI.start, "START", PLAYER_COLOR, true, 15 * S);
+      drawBtn(lobbyUI.start, "START", canStart ? PLAYER_COLOR : "#3f6b78", true, 15 * S, canStart ? 1 : 0.45);
       lobbyUI.leave = { x: cx + gap / 2, y: byy, w: bw, h: bh };
       drawBtn(lobbyUI.leave, "LEAVE", "#e2724f", false, 13 * S);
       lobbyUI.ready = null;
@@ -3627,13 +3632,17 @@ function lobbyTap(p) {
   if (net.role === "host") {
     if (inR(p, lobbyUI.start)) {
       sfx("ui");
-      // warn (once) if any joined player hasn't readied — second tap starts anyway
-      if (!allPlayersReady() && !net.startWarned) {
+      // hard block: need at least one joiner AND everyone readied — no force start
+      if (!canStartMatch()) {
         net.startWarned = true;
-        const waiting = net.players.filter(pl => pl.faction !== 0 && !pl.ready);
-        net.status = (waiting.length === 1)
-          ? (waiting[0].name + " isn't ready — tap START again to begin")
-          : (waiting.length + " players aren't ready — tap START again to begin");
+        if (net.players.length < 2) {
+          net.status = "Can't start yet — waiting for players to join";
+        } else {
+          const waiting = net.players.filter(pl => pl.faction !== 0 && !pl.ready);
+          net.status = (waiting.length === 1)
+            ? ("Can't start — " + waiting[0].name + " isn't ready")
+            : ("Can't start — " + waiting.length + " players aren't ready");
+        }
         return;
       }
       netStartHost();
