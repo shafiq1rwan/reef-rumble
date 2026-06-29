@@ -287,12 +287,16 @@ function updateMusic() {
 const keys = {};
 let mouseScreenX = 0, mouseScreenY = 0;   // in internal-render coords
 let mouseDown = false;
+// hybrid devices (touch laptops) report touch support yet use a mouse — track
+// the last input so the mouse aims when used and the sticks show only for touch
+let usingMouse = false;
 
 // menu hit-rects (filled in each frame by the matching draw function)
 const titleBtns   = { play: null, how: null, settings: null };
 const weaponUI    = { prev: null, next: null, start: null, back: null };
 const settingsUI  = { music: null, sfx: null, back: null };
 const howtoUI     = { back: null };
+const pauseUI     = { resume: null, menu: null };
 function inR(p, r) { return r && p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h; }
 
 window.addEventListener("keydown", e => {
@@ -319,10 +323,11 @@ function toInternal(clientX, clientY) {
   const r = canvas.getBoundingClientRect();
   return { x: (clientX - r.left) / r.width * VIEW_W, y: (clientY - r.top) / r.height * VIEW_H };
 }
-canvas.addEventListener("mousemove", e => { const p = toInternal(e.clientX, e.clientY); mouseScreenX = p.x; mouseScreenY = p.y; });
+canvas.addEventListener("mousemove", e => { const p = toInternal(e.clientX, e.clientY); mouseScreenX = p.x; mouseScreenY = p.y; usingMouse = true; });
 canvas.addEventListener("mousedown", e => {
   if (e.button !== 0) return;
   initAudio();
+  usingMouse = true;
   const p = toInternal(e.clientX, e.clientY);
   if (game.state === "PLAYING") {
     const pbq = pauseBtn();
@@ -360,9 +365,8 @@ function menuTap(p) {
     case "GAMEOVER": case "VICTORY":
       game.state = "TITLE"; return;
     case "PAUSED": {
-      const rbq = resumeBtn();
-      if (inCircle(p.x, p.y, rbq.x, rbq.y, rbq.r + 12)) game.state = "PLAYING";
-      else if (inRect(p.x, p.y, menuBtn())) game.state = "TITLE";
+      if (inR(p, pauseUI.resume)) { sfx("ui"); game.state = "PLAYING"; }
+      else if (inR(p, pauseUI.menu)) { sfx("ui"); game.state = "TITLE"; }
       return;
     }
   }
@@ -429,6 +433,7 @@ let wsSwipe = null;   // weapon-select swipe tracking
 function onTouchStart(e) {
   e.preventDefault();
   initAudio();
+  usingMouse = false;   // switch to touch controls
   for (const t of e.changedTouches) {
     const p = toInternal(t.clientX, t.clientY);
     // any non-gameplay screen routes through menuTap (plus weapon-swipe tracking)
@@ -796,7 +801,7 @@ const game = {
   shakeX: 0, shakeY: 0,
   flash: 0,
   countdown: -1,      // start-of-match 3-2-1-GO timer (>-0.7 = showing)
-  pct: { player: 0, enemy: 0 },
+  pct: { player: 0, enemy: 0, gangs: [0, 0, 0] },
   result: null,
 };
 let player = makePlayer();
@@ -923,9 +928,9 @@ function updatePlayer(dt) {
   }
 
   // --- aim ---
-  if (isTouch) {
-    // single-stick aiming: lock onto the nearest rival while firing, otherwise
-    // aim in the direction you're moving (last facing kept when idle)
+  if (isTouch && !usingMouse) {
+    // single-stick aiming (touch): lock onto the nearest rival while firing,
+    // otherwise aim in the direction you're moving (last facing kept when idle)
     let aimed = false;
     if (btnShoot.pressed && !player.diving) {
       let best = null, bd = 8;
@@ -935,13 +940,15 @@ function updatePlayer(dt) {
     if (!aimed && il > 0.001) player.aim = Math.atan2(wy, wx);
     const scr = worldToScreen(Math.cos(player.aim), Math.sin(player.aim));
     player.facing = scr.x >= 0 ? 1 : -1;
-  } else if (!isTouch) {
-    // mouse aim: convert mouse screen pos to the world point under the cursor
-    const worldTarget = screenToWorld(
-      (mouseScreenX - VIEW_W/2 + camera.x),
-      (mouseScreenY - VIEW_H/2 + camera.y)
-    );
-    player.aim = Math.atan2(worldTarget.y - player.y, worldTarget.x - player.x);
+  } else {
+    // mouse aim — measure from the shark's on-screen BODY (a bit above its feet)
+    // so the cursor lines up with where you actually see the character. The
+    // screen->world delta is then the world aim direction (shake-free origin).
+    const sc = worldToScreen(player.x, player.y);
+    const psx = sc.x - camera.x + VIEW_W / 2;
+    const psy = sc.y - camera.y + VIEW_H / 2 - 14;   // 14px up = body height
+    const w = screenToWorld(mouseScreenX - psx, mouseScreenY - psy);
+    if (Math.abs(w.x) + Math.abs(w.y) > 0.0001) player.aim = Math.atan2(w.y, w.x);
     const scr = worldToScreen(Math.cos(player.aim), Math.sin(player.aim));
     player.facing = scr.x >= 0 ? 1 : -1;
   }
@@ -1603,20 +1610,35 @@ function paintTiles(cx, cy, radius, owner, color) {
   }
 }
 
-// Recompute territory percentages
+// Which gang owns a given ink colour (rivals are distinguished by their ink)
+const GANG_BY_INK = {};
+ENEMY_COLORS.forEach((c, i) => { GANG_BY_INK[c.ink] = i; });
+
+// Count coverage for the player and each of the 3 rival gangs separately
+function tallyTerritory() {
+  let p = 0; const g = [0, 0, 0];
+  for (const t of map) {
+    if (t.terrain === T_OBST) continue;
+    if (t.owner === OWN_PLAYER) p++;
+    else if (t.owner === OWN_ENEMY) {
+      const gi = GANG_BY_INK[t.inkColor];
+      g[(gi == null ? 0 : gi)]++;
+    }
+  }
+  return { p, g };
+}
+
+// Recompute territory percentages (throttled)
 let pctTimer = 0;
 function updateTerritory(dt) {
   pctTimer -= dt;
   if (pctTimer > 0) return;
   pctTimer = 0.4; // update a few times per second (cheap)
-  let pCount = 0, eCount = 0;
-  for (const t of map) {
-    if (t.terrain === T_OBST) continue;
-    if (t.owner === OWN_PLAYER) pCount++;
-    else if (t.owner === OWN_ENEMY) eCount++;
-  }
-  game.pct.player = paintableTotal ? (pCount / paintableTotal * 100) : 0;
-  game.pct.enemy  = paintableTotal ? (eCount / paintableTotal * 100) : 0;
+  const { p, g } = tallyTerritory();
+  const tot = paintableTotal || 1;
+  game.pct.player = p / tot * 100;
+  game.pct.gangs = [g[0] / tot * 100, g[1] / tot * 100, g[2] / tot * 100];
+  game.pct.enemy = (g[0] + g[1] + g[2]) / tot * 100;
 }
 
 /* ============================================================
@@ -1703,19 +1725,16 @@ function update(dt) {
 }
 
 function endMatch() {
-  updateTerritory(99); // force final recompute
-  // recompute exactly
-  let pCount = 0, eCount = 0;
-  for (const t of map) {
-    if (t.terrain === T_OBST) continue;
-    if (t.owner === OWN_PLAYER) pCount++;
-    else if (t.owner === OWN_ENEMY) eCount++;
-  }
-  game.pct.player = paintableTotal ? (pCount / paintableTotal * 100) : 0;
-  game.pct.enemy  = paintableTotal ? (eCount / paintableTotal * 100) : 0;
-  const win = pCount > eCount;
+  const { p, g } = tallyTerritory();
+  const tot = paintableTotal || 1;
+  game.pct.player = p / tot * 100;
+  game.pct.gangs = [g[0] / tot * 100, g[1] / tot * 100, g[2] / tot * 100];
+  game.pct.enemy = (g[0] + g[1] + g[2]) / tot * 100;
+  // four-way turf war: you win by holding the MOST reef of all four factions
+  const maxGang = Math.max(g[0], g[1], g[2]);
+  const win = p >= maxGang && p > 0;
   game.result = {
-    win, pCount, eCount,
+    win, pCount: p, gangs: g.slice(), maxGang,
     coverScore: Math.round(game.pct.player * 10),
     killScore: player.kills * 100,
     total: Math.round(game.pct.player * 10) + player.kills * 100,
@@ -1742,7 +1761,7 @@ function render() {
   // HUD overlays
   drawHUD();
   drawMinimap();
-  if (isTouch) drawMobileControls();
+  if (isTouch && !usingMouse) drawMobileControls();
 
   // start-of-match countdown overlay
   if (game.state === "PLAYING" && game.countdown > -0.7) drawCountdown();
@@ -2393,73 +2412,143 @@ function hudBar(x, y, w, h, frac, col) {
 }
 function pauseBtn() { return { x: VIEW_W - 16 * UI, y: 16 * UI, r: 12 * UI }; }
 function ovScale() { return clamp(Math.min(VIEW_W / 520, VIEW_H / 360), 0.6, 1.6); }
-function resumeBtn() { const S = ovScale(); return { x: VIEW_W / 2, y: VIEW_H / 2 + 18 * S, r: 30 * S }; }
-function menuBtn()   { const S = ovScale(); return { x: VIEW_W / 2 - 64 * S, y: VIEW_H / 2 + 60 * S, w: 128 * S, h: 26 * S }; }
 function inRect(px, py, r) { return px >= r.x && px <= r.x + r.w && py >= r.y && py <= r.y + r.h; }
+
+// chunky segmented bar (the green-bar look from the HUD mock-up)
+function segBar(x, y, w, h, frac, col) {
+  x = Math.round(x); y = Math.round(y); w = Math.round(w); h = Math.round(h);
+  ctx.fillStyle = "#06202e"; ctx.fillRect(x, y, w, h);
+  const fw = Math.round((w - 2) * clamp(frac, 0, 1));
+  if (fw > 0) {
+    ctx.fillStyle = col; ctx.fillRect(x + 1, y + 1, fw, h - 2);
+    ctx.fillStyle = "rgba(255,255,255,0.22)"; ctx.fillRect(x + 1, y + 1, fw, Math.max(1, Math.round(h * 0.28)));
+  }
+  const seg = Math.max(5, Math.round(w / 9));
+  ctx.fillStyle = "rgba(3,12,22,0.7)";
+  for (let sx = x + seg; sx < x + w - 1; sx += seg) ctx.fillRect(sx, y, Math.max(1, Math.round(UI)), h);
+  ctx.strokeStyle = "rgba(40,196,228,0.45)"; ctx.lineWidth = 1; ctx.strokeRect(x + 0.5, y + 0.5, w, h);
+}
+function barText(cx, cy, txt) {
+  ctx.textAlign = "center"; ctx.textBaseline = "middle"; ctx.font = hudFont(8);
+  ctx.fillStyle = "rgba(3,12,22,0.85)"; ctx.fillText(txt, cx + 1, cy + 1);
+  ctx.fillStyle = "#eaffff"; ctx.fillText(txt, cx, cy);
+  ctx.textBaseline = "alphabetic"; ctx.textAlign = "left";
+}
+// round shark portrait for the status panel
+function drawSharkPortrait(cx, cy, r) {
+  ctx.fillStyle = "#0c2c3a"; ctx.beginPath(); ctx.arc(cx, cy, r + 2, 0, TAU); ctx.fill();
+  ctx.fillStyle = PLAYER_BODY; ctx.beginPath(); ctx.arc(cx, cy, r, 0, TAU); ctx.fill();
+  ctx.fillStyle = shade(PLAYER_BODY, 0.28); ctx.beginPath(); ctx.ellipse(cx, cy + r * 0.42, r * 0.7, r * 0.45, 0, 0, Math.PI); ctx.fill();
+  ctx.fillStyle = PLAYER_BODY_DARK; poly(cx - 1, cy - r * 0.78, [[0, 3], [-4, -6], [6, -1]]); // fin
+  ctx.fillStyle = "#0e2c36"; rrect(cx - r * 0.92, cy - r * 0.28, r * 1.84, r * 0.3); // goggle strap
+  const ex = r * 0.42, ey = cy - r * 0.06, er = r * 0.3;
+  ctx.fillStyle = "#fff";
+  ctx.beginPath(); ctx.arc(cx - ex, ey, er, 0, TAU); ctx.fill(); ctx.beginPath(); ctx.arc(cx + ex, ey, er, 0, TAU); ctx.fill();
+  ctx.fillStyle = "#06202b";
+  ctx.beginPath(); ctx.arc(cx - ex + 1, ey, er * 0.5, 0, TAU); ctx.fill(); ctx.beginPath(); ctx.arc(cx + ex + 1, ey, er * 0.5, 0, TAU); ctx.fill();
+  ctx.strokeStyle = PLAYER_COLOR; ctx.lineWidth = Math.max(1, UI);
+  ctx.beginPath(); ctx.arc(cx - ex, ey, er + 1, 0, TAU); ctx.stroke(); ctx.beginPath(); ctx.arc(cx + ex, ey, er + 1, 0, TAU); ctx.stroke();
+  ctx.fillStyle = "#fff"; for (let i = 0; i < 3; i++) ctx.fillRect(cx - r * 0.32 + i * r * 0.26, cy + r * 0.52, r * 0.13, r * 0.2); // teeth
+  // HP-tinted rim
+  ctx.strokeStyle = player.hp > 40 ? "#37e07a" : "#ff5b5b"; ctx.lineWidth = Math.max(1.5, 1.6 * UI);
+  ctx.beginPath(); ctx.arc(cx, cy, r + 2, 0, TAU); ctx.stroke();
+}
+function drawAbilityGlyph(type, x, y, s, col) {
+  ctx.save(); ctx.translate(x, y); ctx.fillStyle = col;
+  if (type === "ink") { ctx.beginPath(); ctx.arc(0, s * 0.3, s * 0.6, 0, TAU); ctx.fill(); poly(0, -s * 0.9, [[-s * 0.45, s * 0.7], [s * 0.45, s * 0.7], [0, -s * 0.3]]); }
+  else if (type === "speed") { poly(-s * 0.55, 0, [[0, -s * 0.7], [0, s * 0.7], [s * 0.55, 0]]); poly(s * 0.05, 0, [[0, -s * 0.7], [0, s * 0.7], [s * 0.55, 0]]); }
+  else if (type === "shield") { poly(0, -s * 0.85, [[-s * 0.7, 0], [s * 0.7, 0], [s * 0.7, s * 0.5], [0, s], [-s * 0.7, s * 0.5]]); }
+  else { ctx.beginPath(); for (let i = 0; i < 10; i++) { const a = -Math.PI / 2 + i * Math.PI / 5, rr = (i % 2) ? s * 0.45 : s; ctx.lineTo(Math.cos(a) * rr, Math.sin(a) * rr); } ctx.closePath(); ctx.fill(); }
+  ctx.restore();
+}
+function drawAbilityIcon(x, y, r, type, color, active) {
+  ctx.globalAlpha = active ? 1 : 0.45;
+  ctx.fillStyle = active ? shade(color, -0.55) : "rgba(8,30,46,0.85)";
+  ctx.beginPath(); ctx.arc(x, y, r, 0, TAU); ctx.fill();
+  ctx.strokeStyle = color; ctx.lineWidth = Math.max(1.5, 2 * UI);
+  ctx.beginPath(); ctx.arc(x, y, r, 0, TAU); ctx.stroke();
+  drawAbilityGlyph(type, x, y, r * 0.55, active ? color : "#7fb0c6");
+  ctx.globalAlpha = 1;
+}
+function drawGear(x, y, r, col) {
+  ctx.fillStyle = col;
+  for (let i = 0; i < 8; i++) { ctx.save(); ctx.translate(x, y); ctx.rotate(i / 8 * TAU); ctx.fillRect(-r * 0.18, -r - 2 * UI, r * 0.36, r * 0.5); ctx.restore(); }
+  ctx.beginPath(); ctx.arc(x, y, r, 0, TAU); ctx.fill();
+  ctx.fillStyle = "#06202b"; ctx.beginPath(); ctx.arc(x, y, r * 0.42, 0, TAU); ctx.fill();
+}
 
 function drawHUD() {
   const pad = 8 * UI;
   ctx.textAlign = "left"; ctx.textBaseline = "alphabetic";
 
-  // ===== TOP-LEFT: player vitals card =====
-  const cw = 158 * UI, ch = 84 * UI;
+  // ===== TOP-LEFT: status panel (portrait + segmented bars + ability icons) =====
+  const cw = 182 * UI, ch = 92 * UI;
   hudPanel(pad, pad, cw, ch);
-  const lx = pad + 8 * UI, bx = pad + 30 * UI, bw = cw - 38 * UI, bh = 9 * UI;
-  // header: YOU + stage
-  ctx.fillStyle = PLAYER_COLOR; ctx.font = hudFont(10);
-  ctx.fillText("YOU", lx, pad + 14 * UI);
-  ctx.fillStyle = "#7fb0c6"; ctx.font = hudFont(8); ctx.textAlign = "right";
-  ctx.fillText(LAYOUT_NAMES[currentLayout], pad + cw - 8 * UI, pad + 14 * UI);
-  ctx.textAlign = "left";
-  // bars
-  let yy = pad + 22 * UI; const rowH = 14 * UI;
-  ctx.font = hudFont(8);
-  ctx.fillStyle = "#bfe9ff"; ctx.fillText("HP", lx, yy + 8 * UI);
-  hudBar(bx, yy, bw, bh, player.hp / PLAYER_MAX_HP, player.hp > 40 ? "#3dff8a" : "#ff5b5b"); yy += rowH;
-  ctx.fillStyle = "#bfe9ff"; ctx.fillText("INK", lx, yy + 8 * UI);
-  hudBar(bx, yy, bw, bh, player.ink / INK_MAX, player.ink < SHOT_COST ? "#4b6b78" : PLAYER_COLOR); yy += rowH;
+  const portR = 15 * UI, portX = pad + portR + 9 * UI, portY = pad + 23 * UI;
+  drawSharkPortrait(portX, portY, portR);
+  const bx = portX + portR + 8 * UI, bw = pad + cw - bx - 8 * UI, bh = 11 * UI;
+  let yy = pad + 7 * UI;
+  segBar(bx, yy, bw, bh, player.hp / PLAYER_MAX_HP, player.hp > 40 ? "#37e07a" : "#ff5b5b");
+  barText(bx + bw / 2, yy + bh / 2, Math.round(player.hp) + " / " + PLAYER_MAX_HP); yy += bh + 4 * UI;
+  segBar(bx, yy, bw, bh, player.ink / INK_MAX, player.ink < SHOT_COST ? "#4b6b78" : PLAYER_COLOR);
+  barText(bx + bw / 2, yy + bh / 2, "INK  " + Math.round(player.ink)); yy += bh + 4 * UI;
   const ready = player.special >= 100;
-  ctx.fillStyle = ready ? "#ffd23d" : "#bfe9ff"; ctx.fillText("SP", lx, yy + 8 * UI);
   ctx.globalAlpha = ready ? (0.6 + 0.4 * Math.sin(bgT * 8)) : 1;
-  hudBar(bx, yy, bw, bh, player.special / 100, ready ? "#ffd23d" : "#b56bff");
-  ctx.globalAlpha = 1; yy += rowH;
-  // score + status row
-  ctx.font = hudFont(9); ctx.fillStyle = "#eaffff";
-  ctx.fillText("SCORE " + (player.score + Math.round(game.pct.player * 10)), lx, yy + 6 * UI);
-  ctx.font = hudFont(8); ctx.textAlign = "right";
-  let chipX = pad + cw - 8 * UI;
-  if (ready)               { ctx.fillStyle = "#ffd23d"; ctx.fillText(isTouch ? "ULTI!" : "ULTI[Q]", chipX, yy + 6 * UI); chipX -= 42 * UI; }
-  if (player.diving)       { ctx.fillStyle = "#3dff8a"; ctx.fillText("DIVE", chipX, yy + 6 * UI); chipX -= 28 * UI; }
-  if (player.shield > 0)   { ctx.fillStyle = "#ffd23d"; ctx.fillText("DEF",  chipX, yy + 6 * UI); chipX -= 24 * UI; }
-  if (player.speedBoost > 0){ ctx.fillStyle = "#7cff4d"; ctx.fillText("SPD",  chipX, yy + 6 * UI); }
+  segBar(bx, yy, bw, bh, player.special / 100, ready ? "#ffd23d" : "#b56bff");
+  ctx.globalAlpha = 1;
+  barText(bx + bw / 2, yy + bh / 2, ready ? "SPECIAL" : "SP  " + Math.round(player.special) + "%");
+  // ability icon row
+  const iconY = pad + ch - 15 * UI, iconR = 9 * UI; let icx = pad + 14 * UI;
+  drawAbilityIcon(icx, iconY, iconR, "special", "#ffd23d", ready); icx += 23 * UI;
+  drawAbilityIcon(icx, iconY, iconR, "speed", "#7cff4d", player.speedBoost > 0); icx += 23 * UI;
+  drawAbilityIcon(icx, iconY, iconR, "shield", "#ffd23d", player.shield > 0); icx += 23 * UI;
+  drawAbilityIcon(icx, iconY, iconR, "ink", PLAYER_COLOR, player.ink >= INK_MAX - 1); icx += 20 * UI;
+  if (ready) {
+    ctx.globalAlpha = 0.6 + 0.4 * Math.sin(bgT * 8);
+    ctx.fillStyle = "#ffd23d"; ctx.font = hudFont(9); ctx.textAlign = "left"; ctx.textBaseline = "middle";
+    ctx.fillText(isTouch ? "READY!" : "SPECIAL READY!", icx, iconY);
+    ctx.globalAlpha = 1; ctx.textBaseline = "alphabetic";
+  } else if (player.diving) {
+    ctx.fillStyle = "#37e07a"; ctx.font = hudFont(9); ctx.textAlign = "left"; ctx.textBaseline = "middle";
+    ctx.fillText("DIVING", icx, iconY); ctx.textBaseline = "alphabetic";
+  }
   ctx.textAlign = "left";
 
-  // ===== TOP-CENTRE: timer + territory =====
-  const tw = 126 * UI, th = 46 * UI, tx = VIEW_W / 2 - tw / 2, ty = pad;
+  // ===== TOP-CENTRE: timer + 4-faction territory =====
+  const tw = 142 * UI, th = 50 * UI, tx = VIEW_W / 2 - tw / 2, ty = pad;
   hudPanel(tx, ty, tw, th);
   const t = Math.max(0, Math.ceil(game.time));
   const timeStr = Math.floor(t / 60) + ":" + (t % 60 < 10 ? "0" : "") + (t % 60);
   ctx.textAlign = "center";
   ctx.fillStyle = game.time < 30 ? "#ff6b6b" : "#eaffff"; ctx.font = hudFont(17);
-  ctx.fillText(timeStr, VIEW_W / 2, ty + 19 * UI);
-  const trX = tx + 10 * UI, trY = ty + 25 * UI, trW = tw - 20 * UI, trH = 8 * UI;
+  ctx.fillText(timeStr, VIEW_W / 2, ty + 18 * UI);
+  // segmented bar split between you + the three rival gangs
+  const trX = tx + 10 * UI, trY = ty + 24 * UI, trW = tw - 20 * UI, trH = 9 * UI;
   ctx.fillStyle = "#06202e"; ctx.fillRect(Math.round(trX), Math.round(trY), Math.round(trW), Math.round(trH));
-  ctx.fillStyle = PLAYER_COLOR; ctx.fillRect(Math.round(trX), Math.round(trY), Math.round(trW * game.pct.player / 100), Math.round(trH));
-  ctx.fillStyle = ENEMY_COLORS[0].ink; ctx.fillRect(Math.round(trX + trW - trW * game.pct.enemy / 100), Math.round(trY), Math.round(trW * game.pct.enemy / 100), Math.round(trH));
-  ctx.fillStyle = "rgba(255,255,255,0.45)"; ctx.fillRect(Math.round(trX + trW / 2), Math.round(trY - 1), 1, Math.round(trH) + 2);
-  ctx.font = hudFont(8);
-  ctx.fillStyle = PLAYER_COLOR; ctx.textAlign = "left";  ctx.fillText(Math.round(game.pct.player) + "%", trX, trY + trH + 9 * UI);
-  ctx.fillStyle = ENEMY_COLORS[0].ink; ctx.textAlign = "right"; ctx.fillText(Math.round(game.pct.enemy) + "%", trX + trW, trY + trH + 9 * UI);
+  const facs = [[game.pct.player, PLAYER_COLOR]];
+  for (let i = 0; i < 3; i++) facs.push([(game.pct.gangs && game.pct.gangs[i]) || 0, ENEMY_COLORS[i].ink]);
+  let xo = trX;
+  for (const f of facs) {
+    const w = trW * f[0] / 100;
+    if (w > 0.5) { ctx.fillStyle = f[1]; ctx.fillRect(Math.round(xo), Math.round(trY), Math.ceil(w), Math.round(trH)); }
+    xo += w;
+  }
+  ctx.strokeStyle = "rgba(40,196,228,0.45)"; ctx.lineWidth = 1; ctx.strokeRect(Math.round(trX) + 0.5, Math.round(trY) + 0.5, Math.round(trW), Math.round(trH));
+  // four mini legend chips: [square] %
+  ctx.font = hudFont(7); ctx.textBaseline = "alphabetic"; ctx.textAlign = "left";
+  const cwc = trW / 4;
+  for (let i = 0; i < 4; i++) {
+    const f = facs[i], cxp = trX + cwc * i;
+    ctx.fillStyle = f[1]; ctx.fillRect(Math.round(cxp), Math.round(trY + trH + 3 * UI), Math.round(4 * UI), Math.round(4 * UI));
+    ctx.fillStyle = i === 0 ? "#eaffff" : "#cfe9ff";
+    ctx.fillText(Math.round(f[0]) + "%", cxp + 6 * UI, trY + trH + 8 * UI);
+  }
   ctx.textAlign = "left";
 
-  // ===== pause button (top-right) =====
+  // ===== gear / pause button (top-right) =====
   const pb = pauseBtn();
-  ctx.fillStyle = "rgba(7,22,36,0.85)"; ctx.beginPath(); ctx.arc(pb.x, pb.y, pb.r, 0, TAU); ctx.fill();
-  ctx.strokeStyle = "rgba(38,196,228,0.6)"; ctx.lineWidth = Math.max(1, UI); ctx.stroke();
-  ctx.fillStyle = "#cfe9ff";
-  const pbw = Math.max(2, 3 * UI), pbh = Math.max(6, 10 * UI);
-  ctx.fillRect(Math.round(pb.x - 4 * UI), Math.round(pb.y - pbh / 2), pbw, pbh);
-  ctx.fillRect(Math.round(pb.x + 4 * UI - pbw), Math.round(pb.y - pbh / 2), pbw, pbh);
+  ctx.fillStyle = "rgba(7,22,36,0.85)"; ctx.beginPath(); ctx.arc(pb.x, pb.y, pb.r + 2 * UI, 0, TAU); ctx.fill();
+  drawGear(pb.x, pb.y, pb.r, "#ffd23d");
 
   // ===== dead overlay (fades in so the death VFX is visible first) =====
   if (player.dead) {
@@ -2852,30 +2941,32 @@ function drawCountdown() {
 
 function drawPause() {
   const S = ovScale(), cx = VIEW_W / 2, cy = VIEW_H / 2;
-  ctx.fillStyle = "rgba(4,14,24,0.8)"; ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+  ctx.fillStyle = "rgba(4,14,24,0.82)"; ctx.fillRect(0, 0, VIEW_W, VIEW_H);
   // card
-  const pw = Math.min(VIEW_W * 0.82, 290 * S), ph = 210 * S;
-  hudPanel(cx - pw / 2, cy - ph / 2, pw, ph);
+  const pw = Math.min(VIEW_W * 0.86, 344 * S), ph = 172 * S;
+  const px0 = cx - pw / 2, py0 = cy - ph / 2;
+  hudPanel(px0, py0, pw, ph);
   ctx.textAlign = "center";
-  ctx.fillStyle = PLAYER_COLOR; ctx.font = "bold " + Math.round(30 * S) + "px 'Trebuchet MS'";
-  ctx.fillText("PAUSED", cx, cy - ph / 2 + 42 * S);
-  // resume button (play triangle)
-  const rb = resumeBtn();
-  ctx.fillStyle = "rgba(8,46,66,0.95)";
-  ctx.beginPath(); ctx.arc(rb.x, rb.y, rb.r, 0, TAU); ctx.fill();
-  ctx.strokeStyle = PLAYER_COLOR; ctx.lineWidth = Math.max(2, 2 * S); ctx.stroke();
+  // pause glyph (two bars) + title
   ctx.fillStyle = PLAYER_COLOR;
-  poly(rb.x + 2 * S, rb.y, [[-7 * S, -9 * S], [-7 * S, 9 * S], [9 * S, 0]]);
-  ctx.fillStyle = "#9cc7da"; ctx.font = "bold " + Math.round(9 * S) + "px monospace";
-  ctx.fillText(isTouch ? "RESUME" : "RESUME (P)", cx, rb.y + rb.r + 12 * S);
-  // main-menu button
-  const mb = menuBtn();
-  ctx.fillStyle = "rgba(60,20,30,0.9)";
-  ctx.fillRect(Math.round(mb.x), Math.round(mb.y), Math.round(mb.w), Math.round(mb.h));
-  ctx.strokeStyle = "#ff8a8a"; ctx.lineWidth = Math.max(1, S);
-  ctx.strokeRect(Math.round(mb.x) + 0.5, Math.round(mb.y) + 0.5, Math.round(mb.w), Math.round(mb.h));
-  ctx.fillStyle = "#ffd0d0"; ctx.font = "bold " + Math.round(11 * S) + "px monospace";
-  ctx.fillText("MAIN MENU", cx, mb.y + mb.h / 2 + 4 * S);
+  ctx.fillRect(Math.round(cx - 11 * S), Math.round(py0 + 22 * S), Math.round(7 * S), Math.round(20 * S));
+  ctx.fillRect(Math.round(cx + 4 * S), Math.round(py0 + 22 * S), Math.round(7 * S), Math.round(20 * S));
+  ctx.fillStyle = PLAYER_COLOR; ctx.font = "bold " + Math.round(24 * S) + "px 'Trebuchet MS'";
+  ctx.fillText("PAUSED", cx, py0 + 64 * S);
+  // stage + time remaining
+  const t = Math.max(0, Math.ceil(game.time));
+  const ts = Math.floor(t / 60) + ":" + (t % 60 < 10 ? "0" : "") + (t % 60);
+  ctx.fillStyle = "#7fb0c6"; ctx.font = "bold " + Math.round(10 * S) + "px monospace";
+  ctx.fillText(LAYOUT_NAMES[currentLayout] + "   ·   " + ts + " left", cx, py0 + 80 * S);
+  // side-by-side buttons
+  const bw = pw * 0.42, bh = 40 * S, gap = pw * 0.06, by = py0 + ph - bh - 20 * S;
+  pauseUI.resume = { x: cx - gap / 2 - bw, y: by, w: bw, h: bh };
+  pauseUI.menu   = { x: cx + gap / 2, y: by, w: bw, h: bh };
+  drawBtn(pauseUI.resume, "RESUME", "#37e07a", true, 15 * S, 0.85 + 0.15 * Math.sin(bgT * 6));
+  drawBtn(pauseUI.menu, "MAIN MENU", "#ff8a8a", false, 13 * S);
+  // hint
+  ctx.fillStyle = "#5a8aa0"; ctx.font = Math.round(8 * S) + "px monospace";
+  ctx.fillText(isTouch ? "tap a button to continue" : "P or Esc resumes", cx, py0 + ph - 7 * S);
   ctx.textAlign = "left";
 }
 
