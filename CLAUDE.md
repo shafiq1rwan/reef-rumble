@@ -31,8 +31,28 @@ Find a section by its banner comment, e.g. `10. ENEMY AI`, `15. UI RENDERING`:
 - **9 Player / 10 Enemy AI / 11 Projectiles / 12 Ink splash / 12b Power-ups /
   13 Particles / 14 Camera**
 - **15 UI rendering** — HUD, minimap, mobile controls (all scale with global `UI`)
-- **16 Game states** — title / pause / result screens (scale with `ovScale()`)
+- **16 Game states** — `drawTitle` / `drawWeaponSelect` / `drawSettings` / `drawHowTo` /
+  `drawCountdown` / `drawPause` / `drawResult` screens (scale with `ovScale()`)
 - **17 update() / 18 render()** then `frame()` (rAF loop) and boot at the very bottom
+
+### Screen flow & menus
+States: `TITLE → WEAPONSELECT → PLAYING` (PLAYING opens with a `game.countdown`
+3-2-1-GO freeze), plus `SETTINGS`, `HOWTO`, `PAUSED`, `GAMEOVER`, `VICTORY`. All
+non-gameplay taps/clicks route through one `menuTap(p)` (mouse + touch); each draw
+function writes its clickable rects into a globals object (`titleBtns`, `weaponUI`,
+`settingsUI`, `howtoUI`) which `menuTap` hit-tests with `inR(p, rect)` — same
+"define the rect once, use it for draw AND hit-test" rule as `pauseBtn()`/`resumeBtn()`.
+Use `drawBtn(rect, label, color, filled, fontPx[, alpha])` for menu buttons.
+
+### Weapons, audio, persistence
+- `WEAPONS[]` (section 1) holds per-weapon stats; `weaponSel` is the chosen index,
+  equipped as `player.weapon` in `startMatch`. Projectiles carry `directDmg` /
+  `splashDmg` / `splashR` (defaults set in `spawnProjectile`, overridden per weapon).
+- `settings { music, sfx }` persists to `localStorage` (`saveSettings()`); `sfx()`
+  is gated by `settings.sfx`. Background music is a synth step-sequencer
+  (`updateMusic()` called each frame; `M_BASS`/`M_ARP` patterns) gated by `settings.music`.
+- The chibi sprite lives in `drawChibiBody(...)`, shared by the in-game shark and the
+  weapon-select character preview.
 
 ## Key conventions (follow these)
 

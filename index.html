@@ -10,19 +10,19 @@
      ============================================================ */
   * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
   html, body {
-    width: 100%; height: 100%; overflow: hidden;
+    /* lock the page to the viewport so mobile can never scroll/overscroll */
+    position: fixed; inset: 0; width: 100%; height: 100%; overflow: hidden;
     background: #04121f;
     font-family: "Trebuchet MS", "Segoe UI", monospace, sans-serif;
     color: #e8fbff;
-    user-select: none; -webkit-user-select: none; touch-action: none;
+    user-select: none; -webkit-user-select: none;
+    touch-action: none; overscroll-behavior: none; -webkit-overflow-scrolling: auto;
   }
   #game {
     display: block;
-    width: 100vw; height: 100vh;
-    /* crisp nearest-neighbor upscaling for pixel-art look */
-    image-rendering: pixelated;
-    image-rendering: -moz-crisp-edges;
-    image-rendering: crisp-edges;
+    position: fixed; top: 0; left: 0;
+    width: 100%; height: 100%;
+    touch-action: none;
     background: #04121f;
   }
   #rotateHint {
@@ -117,46 +117,49 @@ const ENEMY_COLORS = [
 // Decoration sub-types for obstacles (visual only)
 const D_CORAL = 0, D_ROCK = 1, D_CRATE = 2, D_SIGN = 3, D_BARRIER = 4;
 
+// Player weapons (picked on the weapon-select screen before a match)
+const WEAPONS = [
+  { name: "Tide Blaster", desc: "Balanced all-rounder.",        cost: 8,  cd: 0.13, speed: 11,  range: 6.5, splashR: 2.2, dmg: 26, splashDmg: 14, pellets: 1, spread: 0.05, big: false },
+  { name: "Reef Spray",   desc: "Rapid fire, short range.",     cost: 4,  cd: 0.07, speed: 12,  range: 4.8, splashR: 1.5, dmg: 12, splashDmg: 7,  pellets: 1, spread: 0.13, big: false },
+  { name: "Deep Cannon",  desc: "Slow but heavy, huge splash.", cost: 22, cd: 0.50, speed: 8.5, range: 8.5, splashR: 3.3, dmg: 40, splashDmg: 22, pellets: 1, spread: 0.02, big: true },
+  { name: "Triad Burst",  desc: "Three-pellet spread blast.",   cost: 14, cd: 0.42, speed: 10,  range: 4.6, splashR: 1.8, dmg: 16, splashDmg: 9,  pellets: 3, spread: 0.26, big: false },
+];
+let weaponSel = 0;   // index into WEAPONS
+
 /* ============================================================
    2. CANVAS SETUP
 
-   Crispness strategy: the whole game is drawn into a low-resolution OFFSCREEN
-   buffer, then blitted ONCE to the visible canvas with image smoothing OFF.
-   The visible canvas is sized to real device pixels, so the only scaling that
-   happens is our own nearest-neighbour drawImage — guaranteed sharp pixels
-   instead of the browser's bilinear upscale (which looked blurry).
+   Crispness strategy: draw EVERYTHING directly to the visible canvas, which is
+   backed by real device pixels (cssSize * devicePixelRatio). A single base
+   transform maps our logical coordinates to device pixels, so text and shapes
+   rasterise at full resolution = razor sharp. We keep a moderate logical size
+   (VIEW_W/VIEW_H) so the zoom and HUD stay consistent across screens.
    ============================================================ */
-const canvas = document.getElementById("game");           // visible canvas
-const screenCtx = canvas.getContext("2d", { alpha: false });
-const buffer = document.createElement("canvas");          // low-res render target
-const ctx = buffer.getContext("2d", { alpha: false });    // everything draws here
-ctx.imageSmoothingEnabled = false;
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d", { alpha: false });
 
-let VIEW_W = 0, VIEW_H = 0;   // logical (buffer) render dimensions
+let VIEW_W = 0, VIEW_H = 0;   // logical render dimensions (control zoom + HUD)
 let UI = 1;                    // HUD scale factor derived from VIEW_W
 
 function resize() {
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
   const cssW = window.innerWidth, cssH = window.innerHeight;
-  // logical buffer width — bigger = sharper/less chunky; scaled for screen size
+  // logical width chosen for a comfortable zoom / HUD size
   const targetW = Math.max(520, Math.min(900, Math.round(cssW / 1.6)));
-  const scale = cssW / targetW;
+  const scale = cssW / targetW;          // CSS px per logical px
   VIEW_W = Math.round(cssW / scale);
   VIEW_H = Math.round(cssH / scale);
-  buffer.width = VIEW_W; buffer.height = VIEW_H;
+  // back the canvas with real device pixels so everything is crisp
   canvas.width = Math.round(cssW * dpr);
   canvas.height = Math.round(cssH * dpr);
   canvas.style.width = cssW + "px";
   canvas.style.height = cssH + "px";
+  // map logical coords -> device pixels (rasterise at full resolution)
+  const deviceScale = canvas.width / VIEW_W;
+  ctx.setTransform(deviceScale, 0, 0, deviceScale, 0, 0);
   ctx.imageSmoothingEnabled = false;
-  screenCtx.imageSmoothingEnabled = false;
   UI = clamp(VIEW_W / 760, 0.72, 1.4);   // HUD elements scale with the viewport
   layoutMobileControls();
-}
-// present the buffer to the screen, nearest-neighbour (called each frame)
-function present() {
-  screenCtx.imageSmoothingEnabled = false;
-  screenCtx.drawImage(buffer, 0, 0, VIEW_W, VIEW_H, 0, 0, canvas.width, canvas.height);
 }
 window.addEventListener("resize", resize);
 window.addEventListener("orientationchange", () => setTimeout(resize, 200));
@@ -223,7 +226,7 @@ function noiseBurst(dur, vol, freq) {
   n.start(t);
 }
 function sfx(kind) {
-  if (!audioCtx) return;
+  if (!audioCtx || !settings.sfx) return;
   switch (kind) {
     case "shoot":  tone(540, 0.08, "square",  0.07, 280); break;
     case "eshoot": tone(360, 0.08, "sawtooth",0.04, 200); break;
@@ -232,6 +235,48 @@ function sfx(kind) {
     case "splat":  noiseBurst(0.18, 0.22, 900); tone(150, 0.2, "square", 0.12, 60); break;
     case "dive":   tone(180, 0.22, "sine",    0.10, 460); break;
     case "ulti":   tone(220, 0.5, "sawtooth", 0.18, 920); noiseBurst(0.45, 0.18, 1500); break;
+    case "count":  tone(640, 0.14, "square",  0.13, 640); break;   // 3 / 2 / 1 beep
+    case "go":     tone(520, 0.30, "square",  0.17, 1040); break;  // rising GO!
+    case "ui":     tone(480, 0.06, "square",  0.06, 600); break;   // menu blip
+  }
+}
+
+/* ---- SETTINGS (persisted) ---- */
+const settings = { music: true, sfx: true };
+try {
+  const sv = JSON.parse(localStorage.getItem("reefRumble.settings"));
+  if (sv) { settings.music = sv.music !== false; settings.sfx = sv.sfx !== false; }
+} catch (e) {}
+function saveSettings() { try { localStorage.setItem("reefRumble.settings", JSON.stringify(settings)); } catch (e) {} }
+
+/* ---- BACKGROUND MUSIC (synthesised loop, no files) ---- */
+let musicGain = null, musicStep = 0, musicNextTime = 0;
+const MUSIC_BPM = 96;
+const M_BASS = [0, 0, 7, 5];                       // root-relative semitones
+const M_ARP  = [12, 15, 19, 15, 12, 19, 24, 19];  // gentle pentatonic arp
+function mnote(freq, t, dur, type, vol) {
+  const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+  o.type = type; o.frequency.value = freq;
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.linearRampToValueAtTime(vol, t + 0.02);
+  g.gain.exponentialRampToValueAtTime(0.0008, t + dur);
+  o.connect(g); g.connect(musicGain);
+  o.start(t); o.stop(t + dur + 0.05);
+}
+function playMusicStep(step, t, spb) {
+  const root = 196; // ~G3
+  if (step % 4 === 0) { const s = M_BASS[(step / 4) % M_BASS.length]; mnote(root / 2 * Math.pow(2, s / 12), t, spb * 3.4, "triangle", 0.5); }
+  const s2 = M_ARP[step % M_ARP.length]; mnote(root * Math.pow(2, s2 / 12), t, spb * 0.9, "sine", 0.16);
+}
+function updateMusic() {
+  if (!audioCtx || !settings.music) return;
+  if (!musicGain) { musicGain = audioCtx.createGain(); musicGain.gain.value = 0.10; musicGain.connect(audioCtx.destination); musicNextTime = audioCtx.currentTime + 0.1; musicStep = 0; }
+  if (musicNextTime < audioCtx.currentTime) musicNextTime = audioCtx.currentTime + 0.05; // resync after pause/off
+  const spb = 60 / MUSIC_BPM / 2; // eighth-note step
+  while (musicNextTime < audioCtx.currentTime + 0.25) {
+    playMusicStep(musicStep, musicNextTime, spb);
+    musicStep = (musicStep + 1) % 16;
+    musicNextTime += spb;
   }
 }
 
@@ -242,6 +287,13 @@ const keys = {};
 let mouseScreenX = 0, mouseScreenY = 0;   // in internal-render coords
 let mouseDown = false;
 
+// menu hit-rects (filled in each frame by the matching draw function)
+const titleBtns   = { play: null, how: null, settings: null };
+const weaponUI    = { prev: null, next: null, start: null, back: null };
+const settingsUI  = { music: null, sfx: null, back: null };
+const howtoUI     = { back: null };
+function inR(p, r) { return r && p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h; }
+
 window.addEventListener("keydown", e => {
   initAudio();
   const k = e.key.toLowerCase();
@@ -249,13 +301,16 @@ window.addEventListener("keydown", e => {
   if ([" ", "arrowup", "arrowdown", "arrowleft", "arrowright"].includes(k)) e.preventDefault();
   // global hotkeys
   if (e.key === "Enter") handleEnter();
-  if (k === "p") { if (game.state === "PLAYING") game.state = "PAUSED"; else if (game.state === "PAUSED") game.state = "PLAYING"; }
+  if (k === "p" && (game.state === "PLAYING" || game.state === "PAUSED"))
+    game.state = (game.state === "PLAYING") ? "PAUSED" : "PLAYING";
   if (k === "q" || k === "e") tryUlti();   // SPECIAL / ULTI
-  // stage selection on the title screen
-  if (game.state === "TITLE") {
-    if (k === "arrowleft" || k === "a") cycleLayout(-1);
-    if (k === "arrowright" || k === "d") cycleLayout(1);
+  if (k === "escape") {
+    if (game.state === "WEAPONSELECT" || game.state === "SETTINGS" || game.state === "HOWTO") game.state = "TITLE";
+    else if (game.state === "PLAYING") game.state = "PAUSED";
   }
+  // left/right: stage on title, weapon on the select screen
+  if (k === "arrowleft" || k === "a") { if (game.state === "TITLE") cycleLayout(-1); else if (game.state === "WEAPONSELECT") cycleWeapon(-1); }
+  if (k === "arrowright" || k === "d") { if (game.state === "TITLE") cycleLayout(1); else if (game.state === "WEAPONSELECT") cycleWeapon(1); }
 });
 window.addEventListener("keyup", e => { keys[e.key.toLowerCase()] = false; });
 
@@ -268,32 +323,53 @@ canvas.addEventListener("mousedown", e => {
   if (e.button !== 0) return;
   initAudio();
   const p = toInternal(e.clientX, e.clientY);
-  // pause / resume button clicks take priority over shooting
-  const pbq = pauseBtn();
-  if (game.state === "PLAYING" && inCircle(p.x, p.y, pbq.x, pbq.y, pbq.r + 8)) { game.state = "PAUSED"; return; }
-  if (game.state === "PAUSED") {
-    const rbq = resumeBtn();
-    if (inCircle(p.x, p.y, rbq.x, rbq.y, rbq.r + 10)) game.state = "PLAYING";
-    else if (inRect(p.x, p.y, menuBtn())) game.state = "TITLE";
+  if (game.state === "PLAYING") {
+    const pbq = pauseBtn();
+    if (inCircle(p.x, p.y, pbq.x, pbq.y, pbq.r + 8)) { game.state = "PAUSED"; return; }
+    mouseDown = true;   // hold to fire
     return;
   }
-  mouseDown = true;
-  handlePointerPress(p);
+  menuTap(p);          // all non-gameplay screens
 });
 window.addEventListener("mouseup", e => { if (e.button === 0) mouseDown = false; });
 canvas.addEventListener("contextmenu", e => e.preventDefault());
 
-// Single handler for UI screen taps/clicks (title, pause, gameover, victory)
-function handlePointerPress(p) {
-  if (game.state === "TITLE") { if (!titleArrowHit(p)) startMatch(); return; }
-  if (game.state === "GAMEOVER" || game.state === "VICTORY") { game.state = "TITLE"; return; }
-  if (game.state === "PAUSED") {
-    // tap resume button area handled in mobile section; otherwise resume
+// Unified tap/click handler for every non-gameplay screen
+function menuTap(p) {
+  switch (game.state) {
+    case "TITLE":
+      if (titleArrowHit(p)) return;
+      if (inR(p, titleBtns.play)) { sfx("ui"); game.state = "WEAPONSELECT"; }
+      else if (inR(p, titleBtns.how)) { sfx("ui"); game.state = "HOWTO"; }
+      else if (inR(p, titleBtns.settings)) { sfx("ui"); game.state = "SETTINGS"; }
+      return;
+    case "WEAPONSELECT":
+      if (inR(p, weaponUI.prev)) cycleWeapon(-1);
+      else if (inR(p, weaponUI.next)) cycleWeapon(1);
+      else if (inR(p, weaponUI.start)) { sfx("ui"); startMatch(); }
+      else if (inR(p, weaponUI.back)) { sfx("ui"); game.state = "TITLE"; }
+      return;
+    case "SETTINGS":
+      if (inR(p, settingsUI.music)) { settings.music = !settings.music; saveSettings(); if (settings.music && audioCtx) musicNextTime = audioCtx.currentTime + 0.05; sfx("ui"); }
+      else if (inR(p, settingsUI.sfx)) { settings.sfx = !settings.sfx; saveSettings(); sfx("ui"); }
+      else if (inR(p, settingsUI.back)) { sfx("ui"); game.state = "TITLE"; }
+      return;
+    case "HOWTO":
+      game.state = "TITLE"; sfx("ui"); return;   // tap anywhere closes
+    case "GAMEOVER": case "VICTORY":
+      game.state = "TITLE"; return;
+    case "PAUSED": {
+      const rbq = resumeBtn();
+      if (inCircle(p.x, p.y, rbq.x, rbq.y, rbq.r + 12)) game.state = "PLAYING";
+      else if (inRect(p.x, p.y, menuBtn())) game.state = "TITLE";
+      return;
+    }
   }
 }
 function handleEnter() {
-  if (game.state === "TITLE") startMatch();
-  else if (game.state === "GAMEOVER" || game.state === "VICTORY") game.state = "TITLE";
+  if (game.state === "TITLE") game.state = "WEAPONSELECT";
+  else if (game.state === "WEAPONSELECT") startMatch();
+  else if (game.state === "GAMEOVER" || game.state === "VICTORY" || game.state === "HOWTO" || game.state === "SETTINGS") game.state = "TITLE";
 }
 
 // Title-screen stage selector (positions filled in by drawTitle each frame)
@@ -301,7 +377,12 @@ const titleUI = { lx: 0, rx: 0, y: 0, r: 20 };
 function cycleLayout(d) {
   const n = LAYOUT_NAMES.length;
   currentLayout = (currentLayout + d + n) % n;
-  sfx("shoot");
+  sfx("ui");
+}
+function cycleWeapon(d) {
+  const n = WEAPONS.length;
+  weaponSel = (weaponSel + d + n) % n;
+  sfx("ui");
 }
 function titleArrowHit(p) {
   if (game.state !== "TITLE") return false;
@@ -316,21 +397,22 @@ function titleArrowHit(p) {
 const isTouch = ("ontouchstart" in window) || (navigator.maxTouchPoints > 0);
 
 // Virtual control state
+// ONE movement stick (left). Aiming follows your move direction and auto-locks
+// onto a nearby rival when you press FIRE — no second joystick needed.
 const moveStick = { active: false, id: -1, cx: 0, cy: 0, x: 0, y: 0, dx: 0, dy: 0, r: 60 };
-const aimStick  = { active: false, id: -1, cx: 0, cy: 0, x: 0, y: 0, dx: 0, dy: 0, r: 60, firing: false };
 const btnShoot  = { x: 0, y: 0, r: 42, id: -1, pressed: false };
 const btnDive   = { x: 0, y: 0, r: 36, id: -1, pressed: false };
 const btnUlti   = { x: 0, y: 0, r: 30, id: -1, pressed: false };
 
 function layoutMobileControls() {
   const u = (typeof UI === "number" && UI) ? UI : 1;
-  moveStick.cx = 70 * u; moveStick.cy = VIEW_H - 70 * u; moveStick.r = 52 * u;
+  const m = 58 * u;
+  moveStick.cx = m + 6 * u; moveStick.cy = VIEW_H - m - 6 * u; moveStick.r = 50 * u;
   moveStick.x = moveStick.cx; moveStick.y = moveStick.cy;
-  aimStick.cx = VIEW_W - 70 * u; aimStick.cy = VIEW_H - 70 * u; aimStick.r = 52 * u;
-  aimStick.x = aimStick.cx; aimStick.y = aimStick.cy;
-  btnShoot.x = VIEW_W - 70 * u; btnShoot.y = VIEW_H - 152 * u; btnShoot.r = 30 * u;
-  btnDive.x  = VIEW_W - 144 * u; btnDive.y  = VIEW_H - 86 * u;  btnDive.r  = 26 * u;
-  btnUlti.x  = VIEW_W - 144 * u; btnUlti.y  = VIEW_H - 152 * u; btnUlti.r  = 26 * u;
+  // right-hand action cluster (no aim stick now)
+  btnShoot.x = VIEW_W - 62 * u; btnShoot.y = VIEW_H - 66 * u; btnShoot.r = 34 * u; // primary FIRE
+  btnDive.x  = VIEW_W - 132 * u; btnDive.y = VIEW_H - 50 * u; btnDive.r  = 26 * u;
+  btnUlti.x  = VIEW_W - 70 * u;  btnUlti.y = VIEW_H - 142 * u; btnUlti.r = 27 * u;
 }
 
 function inCircle(px, py, cx, cy, r) { return dist2(px, py, cx, cy) <= r*r; }
@@ -342,18 +424,16 @@ if (isTouch) {
   canvas.addEventListener("touchcancel", onTouchEnd, { passive: false });
 }
 
+let wsSwipe = null;   // weapon-select swipe tracking
 function onTouchStart(e) {
   e.preventDefault();
   initAudio();
   for (const t of e.changedTouches) {
     const p = toInternal(t.clientX, t.clientY);
-    // UI-state screens: any tap advances
-    if (game.state === "TITLE") { if (!titleArrowHit(p)) startMatch(); return; }
-    if (game.state === "GAMEOVER" || game.state === "VICTORY") { game.state = "TITLE"; return; }
-    if (game.state === "PAUSED") {
-      const rbq = resumeBtn();
-      if (inCircle(p.x, p.y, rbq.x, rbq.y, rbq.r + 16)) game.state = "PLAYING";
-      else if (inRect(p.x, p.y, menuBtn())) game.state = "TITLE";
+    // any non-gameplay screen routes through menuTap (plus weapon-swipe tracking)
+    if (game.state !== "PLAYING") {
+      if (game.state === "WEAPONSELECT") wsSwipe = { id: t.identifier, x: p.x };
+      menuTap(p);
       return;
     }
     // pause button (top-right)
@@ -363,13 +443,10 @@ function onTouchStart(e) {
     if (inCircle(p.x, p.y, btnUlti.x, btnUlti.y, btnUlti.r + 8))   { btnUlti.id  = t.identifier; btnUlti.pressed = true; tryUlti(); continue; }
     if (inCircle(p.x, p.y, btnShoot.x, btnShoot.y, btnShoot.r + 8)) { btnShoot.id = t.identifier; btnShoot.pressed = true; continue; }
     if (inCircle(p.x, p.y, btnDive.x, btnDive.y, btnDive.r + 8))   { btnDive.id  = t.identifier; btnDive.pressed = true; continue; }
-    // sticks: left half = move, right half = aim
-    if (p.x < VIEW_W/2 && !moveStick.active) {
+    // movement stick — placed wherever the left thumb lands (left ~60% of screen)
+    if (p.x < VIEW_W * 0.6 && !moveStick.active) {
       moveStick.active = true; moveStick.id = t.identifier;
       moveStick.cx = p.x; moveStick.cy = p.y; moveStick.x = p.x; moveStick.y = p.y; moveStick.dx = 0; moveStick.dy = 0;
-    } else if (!aimStick.active) {
-      aimStick.active = true; aimStick.id = t.identifier; aimStick.firing = true;
-      aimStick.cx = p.x; aimStick.cy = p.y; aimStick.x = p.x; aimStick.y = p.y; aimStick.dx = 0; aimStick.dy = 0;
     }
   }
 }
@@ -378,7 +455,6 @@ function onTouchMove(e) {
   for (const t of e.changedTouches) {
     const p = toInternal(t.clientX, t.clientY);
     if (t.identifier === moveStick.id) updateStick(moveStick, p);
-    else if (t.identifier === aimStick.id) updateStick(aimStick, p);
   }
 }
 function updateStick(s, p) {
@@ -391,8 +467,15 @@ function updateStick(s, p) {
 function onTouchEnd(e) {
   e.preventDefault();
   for (const t of e.changedTouches) {
+    // weapon-select horizontal swipe → change weapon
+    if (wsSwipe && t.identifier === wsSwipe.id) {
+      if (game.state === "WEAPONSELECT") {
+        const dx = toInternal(t.clientX, t.clientY).x - wsSwipe.x;
+        if (dx < -40) cycleWeapon(1); else if (dx > 40) cycleWeapon(-1);
+      }
+      wsSwipe = null;
+    }
     if (t.identifier === moveStick.id) { moveStick.active = false; moveStick.id = -1; moveStick.dx = 0; moveStick.dy = 0; }
-    if (t.identifier === aimStick.id)  { aimStick.active = false; aimStick.id = -1; aimStick.dx = 0; aimStick.dy = 0; aimStick.firing = false; }
     if (t.identifier === btnShoot.id)  { btnShoot.id = -1; btnShoot.pressed = false; }
     if (t.identifier === btnDive.id)   { btnDive.id = -1; btnDive.pressed = false; }
     if (t.identifier === btnUlti.id)   { btnUlti.id = -1; btnUlti.pressed = false; }
@@ -594,6 +677,10 @@ function spawnProjectile(x, y, dx, dy, owner, color, dark, speed, range, fromPla
   p.owner = owner; p.color = color; p.dark = dark;
   p.speed = speed; p.range = range; p.travelled = 0;
   p.fromPlayer = fromPlayer; p.r = 0.28; p.spin = rand(0, TAU);
+  // damage / paint defaults (player weapons override these after spawning)
+  p.directDmg = fromPlayer ? 26 : 14;
+  p.splashDmg = fromPlayer ? 14 : 8;
+  p.splashR = SPLASH_RADIUS;
   return p;
 }
 
@@ -707,6 +794,7 @@ const game = {
   shake: 0,
   shakeX: 0, shakeY: 0,
   flash: 0,
+  countdown: -1,      // start-of-match 3-2-1-GO timer (>-0.7 = showing)
   pct: { player: 0, enemy: 0 },
   result: null,
 };
@@ -720,12 +808,15 @@ function startMatch() {
   generateMap();
   countPaintable();
   player = makePlayer();
+  player.weapon = WEAPONS[weaponSel];   // equip the chosen weapon
   enemies = [makeEnemy(0), makeEnemy(1), makeEnemy(2)];
   projectiles.length = 0; particles.length = 0; floaters.length = 0; impacts.length = 0;
   pickups.length = 0; pickupTimer = 4; flashes.length = 0;
   game.time = MATCH_TIME;
   game.shake = 0; game.flash = 0;
+  game.countdown = 3.0;      // 3 · 2 · 1 · GO! intro
   game.state = "PLAYING";
+  sfx("count");              // beep for the opening "3"
   // snap camera to player
   const sp = worldToScreen(player.x, player.y);
   camera.x = camera.tx = sp.x; camera.y = camera.ty = sp.y;
@@ -830,10 +921,16 @@ function updatePlayer(dt) {
   }
 
   // --- aim ---
-  if (isTouch && aimStick.active && (Math.abs(aimStick.dx) + Math.abs(aimStick.dy) > 0.15)) {
-    // aim in world space from stick (screen) direction
-    const w = screenToWorld(aimStick.dx, aimStick.dy);
-    player.aim = Math.atan2(w.y, w.x);
+  if (isTouch) {
+    // single-stick aiming: lock onto the nearest rival while firing, otherwise
+    // aim in the direction you're moving (last facing kept when idle)
+    let aimed = false;
+    if (btnShoot.pressed && !player.diving) {
+      let best = null, bd = 8;
+      for (const e of enemies) { if (e.dead) continue; const d = dist(player.x, player.y, e.x, e.y); if (d < bd) { bd = d; best = e; } }
+      if (best) { player.aim = Math.atan2(best.y - player.y, best.x - player.x); aimed = true; }
+    }
+    if (!aimed && il > 0.001) player.aim = Math.atan2(wy, wx);
     const scr = worldToScreen(Math.cos(player.aim), Math.sin(player.aim));
     player.facing = scr.x >= 0 ? 1 : -1;
   } else if (!isTouch) {
@@ -847,19 +944,24 @@ function updatePlayer(dt) {
     player.facing = scr.x >= 0 ? 1 : -1;
   }
 
-  // --- shooting ---
+  // --- shooting (uses the selected weapon's stats) ---
+  const wpn = player.weapon || WEAPONS[0];
   player.shootCd -= dt;
   const wantShoot = (mouseDown || keys[" "] || btnShoot.pressed);
-  if (wantShoot && !player.diving && player.shootCd <= 0 && player.ink >= SHOT_COST) {
-    player.shootCd = 0.13;
-    player.ink -= SHOT_COST;
+  if (wantShoot && !player.diving && player.shootCd <= 0 && player.ink >= wpn.cost) {
+    player.shootCd = wpn.cd;
+    player.ink -= wpn.cost;
     player.special = Math.min(100, player.special + 1.3); // build SPECIAL meter
     player.squash = -0.5; // recoil stretch
-    const ang = player.aim + rand(-0.05, 0.05);
-    const dx = Math.cos(ang), dy = Math.sin(ang);
-    // muzzle offset
-    spawnProjectile(player.x + dx*0.4, player.y + dy*0.4, dx, dy, OWN_PLAYER, PLAYER_COLOR, PLAYER_COLOR_DARK, 11, 6.5, true);
-    addFlash(player.x + dx*0.45, player.y + dy*0.45, ang, PLAYER_COLOR); // muzzle VFX
+    for (let i = 0; i < wpn.pellets; i++) {
+      const spreadOff = wpn.pellets > 1 ? (i - (wpn.pellets - 1) / 2) * wpn.spread : 0;
+      const ang = player.aim + spreadOff + rand(-wpn.spread, wpn.spread) * (wpn.pellets > 1 ? 0.3 : 1);
+      const dx = Math.cos(ang), dy = Math.sin(ang);
+      const pr = spawnProjectile(player.x + dx * 0.4, player.y + dy * 0.4, dx, dy, OWN_PLAYER, PLAYER_COLOR, PLAYER_COLOR_DARK, wpn.speed, wpn.range, true);
+      pr.directDmg = wpn.dmg; pr.splashDmg = wpn.splashDmg; pr.splashR = wpn.splashR; pr.r = wpn.big ? 0.42 : 0.28;
+    }
+    const fa = player.aim;
+    addFlash(player.x + Math.cos(fa) * 0.45, player.y + Math.sin(fa) * 0.45, fa, PLAYER_COLOR);
     sfx("shoot");
   }
 
@@ -990,10 +1092,18 @@ function updateEnemy(e, dt) {
     }
   }
 
-  // chase overrides target each frame
+  // chase: hold a shooting STANDOFF distance and circle the player instead of
+  // gluing onto them. Aiming for a point on a ring around the player makes the
+  // rival approach when far, back off when too close, and strafe while in range.
   if (e.state === "CHASE" && !player.dead) {
-    e.targetX = player.x; e.targetY = player.y;
     e.aim = Math.atan2(player.y - e.y, player.x - e.x);
+    const STANDOFF = 4.2;
+    const dd = dToPlayer || 1;
+    const ux = (e.x - player.x) / dd, uy = (e.y - player.y) / dd;   // player -> enemy dir
+    const perpx = -uy, perpy = ux;                                  // sideways
+    const swirl = Math.sin(bgT * 1.1 + e.id * 2.1) * 2.6;          // gentle orbit
+    e.targetX = clamp(player.x + ux * STANDOFF + perpx * swirl, 1.5, MAP_W - 2.5);
+    e.targetY = clamp(player.y + uy * STANDOFF + perpy * swirl, 1.5, MAP_H - 2.5);
   }
 
   // --- dive when recharging on own ink ---
@@ -1129,18 +1239,18 @@ function updateProjectiles(dt) {
       if (p.fromPlayer) {
         for (const e of enemies) {
           if (!e.dead && e.iframe <= 0 && dist2(p.x, p.y, e.x, e.y) < 0.32*0.32 + p.r*p.r) {
-            damageEnemy(e, 26); hit = true; break;
+            damageEnemy(e, p.directDmg); hit = true; break;
           }
         }
       } else {
         if (!player.dead && player.iframe <= 0 && dist2(p.x, p.y, player.x, player.y) < 0.34*0.34 + p.r*p.r) {
-          damagePlayer(14, false); hit = true;
+          damagePlayer(p.directDmg, false); hit = true;
         }
       }
     }
     if (hit) {
       p.alive = false;
-      onSplash(p.x, p.y, p.owner, p.color, p.dark, p.fromPlayer);
+      onSplash(p.x, p.y, p.owner, p.color, p.dark, p.fromPlayer, p.splashR, p.splashDmg);
     }
   }
 }
@@ -1171,19 +1281,22 @@ function damageEnemy(e, amount) {
 /* ============================================================
    12. INK SPLASH / PAINTING
    ============================================================ */
-function onSplash(x, y, owner, color, dark, fromPlayer) {
-  paintTiles(x, y, SPLASH_RADIUS, owner, color);
+function onSplash(x, y, owner, color, dark, fromPlayer, splashR, splashDmg) {
+  splashR = splashR || SPLASH_RADIUS;
+  splashDmg = splashDmg == null ? 12 : splashDmg;
+  paintTiles(x, y, splashR, owner, color);
   // damage entities inside splash radius
   let didHit = false;
   if (fromPlayer) {
     for (const e of enemies)
-      if (!e.dead && e.iframe <= 0 && dist(x, y, e.x, e.y) < SPLASH_RADIUS * 0.6) { damageEnemy(e, 14); didHit = true; }
+      if (!e.dead && e.iframe <= 0 && dist(x, y, e.x, e.y) < splashR * 0.6) { damageEnemy(e, splashDmg); didHit = true; }
   } else {
-    if (!player.dead && player.iframe <= 0 && dist(x, y, player.x, player.y) < SPLASH_RADIUS * 0.6)
-      { damagePlayer(8, false); didHit = true; }
+    if (!player.dead && player.iframe <= 0 && dist(x, y, player.x, player.y) < splashR * 0.6)
+      { damagePlayer(splashDmg, false); didHit = true; }
   }
+  const big = splashR >= 2.8;
   // ink splat decal + expanding ring on the floor (bigger/brighter on a hit)
-  addImpact(x, y, didHit ? "#ffffff" : color, didHit, color);
+  addImpact(x, y, didHit ? "#ffffff" : color, didHit || big, color);
   // radial splash particles
   const n = didHit ? 14 : 9;
   for (let i = 0; i < n; i++) {
@@ -1449,6 +1562,16 @@ function project(wx, wy) {
 function update(dt) {
   if (game.state !== "PLAYING") return;
 
+  // intro "3 · 2 · 1 · GO!" — freeze the action (and the match clock) until GO
+  if (game.countdown > -0.7) {
+    const prevCeil = Math.ceil(Math.max(0, game.countdown));
+    game.countdown -= dt;
+    const nowCeil = Math.ceil(Math.max(0, game.countdown));
+    if (nowCeil !== prevCeil) sfx(nowCeil > 0 ? "count" : "go");
+    if (game.countdown > 0) { updateCamera(dt); return; }   // stay frozen on 3/2/1
+    // at GO the match begins; "GO!" keeps flashing for a beat while we play on
+  }
+
   // match timer
   game.time -= dt;
   if (game.time <= 0) { game.time = 0; endMatch(); return; }
@@ -1499,6 +1622,9 @@ function render() {
   drawWaterBackground();
 
   if (game.state === "TITLE") { drawTitle(); return; }
+  if (game.state === "WEAPONSELECT") { drawWeaponSelect(); return; }
+  if (game.state === "SETTINGS") { drawSettings(); return; }
+  if (game.state === "HOWTO") { drawHowTo(); return; }
 
   drawArena();
 
@@ -1506,6 +1632,9 @@ function render() {
   drawHUD();
   drawMinimap();
   if (isTouch) drawMobileControls();
+
+  // start-of-match countdown overlay
+  if (game.state === "PLAYING" && game.countdown > -0.7) drawCountdown();
 
   if (game.state === "PAUSED")   drawPause();
   if (game.state === "GAMEOVER") drawResult(false);
@@ -1654,7 +1783,7 @@ function drawReticle() {
   if (game.state !== "PLAYING" || player.dead || player.diving) return;
   const muzX = player.x + Math.cos(player.aim) * 0.4;
   const muzY = player.y + Math.sin(player.aim) * 0.4;
-  const imp = predictImpact(muzX, muzY, player.aim, 6.5);
+  const imp = predictImpact(muzX, muzY, player.aim, (player.weapon || WEAPONS[0]).range);
   const r = project(imp.x, imp.y);
   const pulse = 0.6 + 0.4 * Math.sin(bgT * 10);
   const lowInk = player.ink < SHOT_COST;
@@ -1921,74 +2050,10 @@ function drawShark(ent, isPlayer) {
   // left/right flip + squash/stretch. Local +x = forward, -y = up.
   const bob = Math.sin(ent.walkPhase) * 1.0;
   const moving = (Math.abs(ent.vx) + Math.abs(ent.vy)) > 0.5;
-  const wag = Math.sin(ent.walkPhase * 1.2 + bgT * 5) * (moving ? 0.55 : 0.3);
-  const belly = shade(col, 0.30);
-  const shell = "#e3c79a", shellSh = "#bd986a", coral = "#d98f86", weed = "#3fae5a";
-  const neon = ink;  // goggles + accents glow in the team ink colour
   ctx.save();
   ctx.translate(px, py + 3 + bob);
   ctx.scale(face * sq, st);
-
-  // --- wagging TAIL (behind, low) ---
-  ctx.fillStyle = dark;
-  poly(-8, -7, [[2, -4], [2, 4], [-10, -2 + wag * 9]]);
-
-  // --- tiny LEGS + seaweed ankle wraps ---
-  ctx.fillStyle = shade(col, -0.12);
-  rrect(-4, -7, 4, 7); rrect(1, -7, 4, 7);
-  ctx.fillStyle = "#0b2935"; rrect(-5, -1, 6, 2); rrect(1, -1, 6, 2);
-  ctx.fillStyle = weed; rrect(-4, -4.5, 4, 1.5); rrect(1, -4.5, 4, 1.5);
-
-  // --- back arm ---
-  ctx.fillStyle = dark; rrect(-7, -15, 3, 7);
-
-  // --- tiny TORSO with coral-shell armour ---
-  ctx.fillStyle = col; rrect(-6, -16, 12, 10);
-  ctx.fillStyle = belly; rrect(-3, -13, 6, 6);
-  ctx.fillStyle = shell; poly(0, -16, [[-6, 1], [6, 1], [5, 7], [0, 9], [-5, 7]]); // chest plate
-  ctx.fillStyle = shellSh; rrect(-6, -16, 12, 2);   // collar
-  ctx.fillStyle = coral; rrect(-1, -15, 2, 8);      // centre ridge
-  // shell shoulder pads
-  ctx.fillStyle = shell;
-  ctx.beginPath(); ctx.arc(-6, -15, 3, 0, TAU); ctx.fill();
-  ctx.beginPath(); ctx.arc(6, -15, 3, 0, TAU); ctx.fill();
-  ctx.fillStyle = coral;
-  ctx.beginPath(); ctx.arc(-6, -15, 1.3, 0, TAU); ctx.fill();
-  ctx.beginPath(); ctx.arc(6, -15, 1.3, 0, TAU); ctx.fill();
-  if (!isPlayer) { ctx.fillStyle = ink; rrect(-6, -9, 12, 2); } // gang sash
-
-  // --- BIG ROUND HEAD ---
-  const hy = -27;
-  ctx.fillStyle = dark; poly(-3, hy - 9, [[0, 2], [-4, -9], [7, -1]]); // dorsal mohawk fin
-  ctx.fillStyle = col; ctx.beginPath(); ctx.ellipse(0, hy, 12, 11, 0, 0, TAU); ctx.fill();
-  ctx.fillStyle = belly; ctx.beginPath(); ctx.ellipse(2, hy + 5, 8, 5, 0, 0, Math.PI); ctx.fill(); // jaw
-  ctx.fillStyle = shade(col, 0.18); ctx.beginPath(); ctx.ellipse(-4, hy - 6, 4, 2.5, 0, 0, TAU); ctx.fill(); // forehead shine
-  ctx.fillStyle = col; ctx.beginPath(); ctx.ellipse(11, hy + 3, 4, 4, 0, 0, TAU); ctx.fill(); // snout
-  ctx.fillStyle = shade(col, -0.28); rrect(2, hy + 6, 11, 1.4);   // smiling mouth
-  ctx.fillStyle = "#ffffff"; for (let i = 0; i < 4; i++) ctx.fillRect(4 + i * 2.4, hy + 6, 1.4, 1.6); // small teeth
-  ctx.fillStyle = shade(col, -0.34); for (let i = 0; i < 3; i++) ctx.fillRect(-9 + i * 1.6, hy + 1, 1, 4); // gills
-
-  // --- BIG EYES + NEON GOGGLES ---
-  ctx.fillStyle = "#0e2c36"; rrect(-12, hy - 4, 24, 3);          // goggle strap
-  ctx.fillStyle = shade(neon, 0.12); rrect(-12, hy - 4, 24, 1);  // neon strap glow
-  const ex1 = -3, ex2 = 5, eyy = hy - 1;
-  ctx.fillStyle = "#ffffff";
-  ctx.beginPath(); ctx.arc(ex1, eyy, 3.4, 0, TAU); ctx.fill();
-  ctx.beginPath(); ctx.arc(ex2, eyy, 3.4, 0, TAU); ctx.fill();
-  ctx.fillStyle = "#06202b";
-  ctx.beginPath(); ctx.arc(ex1 + 1, eyy, 1.7, 0, TAU); ctx.fill();
-  ctx.beginPath(); ctx.arc(ex2 + 1, eyy, 1.7, 0, TAU); ctx.fill();
-  ctx.fillStyle = "#cdf6ff"; ctx.fillRect(ex1, eyy - 1, 1, 1); ctx.fillRect(ex2, eyy - 1, 1, 1);
-  ctx.strokeStyle = neon; ctx.lineWidth = 1.5;                   // neon goggle rims
-  ctx.beginPath(); ctx.arc(ex1, eyy, 4.2, 0, TAU); ctx.stroke();
-  ctx.beginPath(); ctx.arc(ex2, eyy, 4.2, 0, TAU); ctx.stroke();
-  ctx.fillStyle = neon; rrect(ex1 + 3.5, eyy - 0.5, 2, 1);       // goggle bridge
-
-  // --- front arm + seaweed wrist wrap ---
-  ctx.fillStyle = col; rrect(4, -15, 4, 7);
-  ctx.fillStyle = weed; rrect(4, -10, 4, 2);
-  ctx.fillStyle = belly; rrect(5, -9, 3, 3);
-
+  drawChibiBody(col, dark, ink, isPlayer, ent.walkPhase, moving);
   ctx.restore();
 
   // shell-and-coral sea-ink blaster, held low in the front hand, aimed in world space
@@ -2020,6 +2085,68 @@ function drawShark(ent, isPlayer) {
   // ink-drip droplets when moving fast
   if ((Math.abs(ent.vx) + Math.abs(ent.vy)) > 4 && Math.random() < 0.2)
     spawnParticle(ent.x, ent.y, rand(-0.5, 0.5), rand(-0.5, 0.5), ink, 0.3, 1, 0.1);
+}
+
+// The chibi shark sprite, drawn facing-right at the current transform origin
+// (feet at 0,0). Shared by the in-game shark and the weapon-select preview.
+function drawChibiBody(col, dark, ink, isPlayer, phase, moving) {
+  const wag = Math.sin(phase * 1.2 + bgT * 5) * (moving ? 0.55 : 0.3);
+  const belly = shade(col, 0.30);
+  const shell = "#e3c79a", shellSh = "#bd986a", coral = "#d98f86", weed = "#3fae5a";
+  const neon = ink;
+
+  // wagging tail
+  ctx.fillStyle = dark;
+  poly(-8, -7, [[2, -4], [2, 4], [-10, -2 + wag * 9]]);
+  // legs + seaweed ankle wraps
+  ctx.fillStyle = shade(col, -0.12);
+  rrect(-4, -7, 4, 7); rrect(1, -7, 4, 7);
+  ctx.fillStyle = "#0b2935"; rrect(-5, -1, 6, 2); rrect(1, -1, 6, 2);
+  ctx.fillStyle = weed; rrect(-4, -4.5, 4, 1.5); rrect(1, -4.5, 4, 1.5);
+  // back arm
+  ctx.fillStyle = dark; rrect(-7, -15, 3, 7);
+  // torso + coral-shell armour
+  ctx.fillStyle = col; rrect(-6, -16, 12, 10);
+  ctx.fillStyle = belly; rrect(-3, -13, 6, 6);
+  ctx.fillStyle = shell; poly(0, -16, [[-6, 1], [6, 1], [5, 7], [0, 9], [-5, 7]]);
+  ctx.fillStyle = shellSh; rrect(-6, -16, 12, 2);
+  ctx.fillStyle = coral; rrect(-1, -15, 2, 8);
+  ctx.fillStyle = shell;
+  ctx.beginPath(); ctx.arc(-6, -15, 3, 0, TAU); ctx.fill();
+  ctx.beginPath(); ctx.arc(6, -15, 3, 0, TAU); ctx.fill();
+  ctx.fillStyle = coral;
+  ctx.beginPath(); ctx.arc(-6, -15, 1.3, 0, TAU); ctx.fill();
+  ctx.beginPath(); ctx.arc(6, -15, 1.3, 0, TAU); ctx.fill();
+  if (!isPlayer) { ctx.fillStyle = ink; rrect(-6, -9, 12, 2); }
+  // big round head
+  const hy = -27;
+  ctx.fillStyle = dark; poly(-3, hy - 9, [[0, 2], [-4, -9], [7, -1]]);
+  ctx.fillStyle = col; ctx.beginPath(); ctx.ellipse(0, hy, 12, 11, 0, 0, TAU); ctx.fill();
+  ctx.fillStyle = belly; ctx.beginPath(); ctx.ellipse(2, hy + 5, 8, 5, 0, 0, Math.PI); ctx.fill();
+  ctx.fillStyle = shade(col, 0.18); ctx.beginPath(); ctx.ellipse(-4, hy - 6, 4, 2.5, 0, 0, TAU); ctx.fill();
+  ctx.fillStyle = col; ctx.beginPath(); ctx.ellipse(11, hy + 3, 4, 4, 0, 0, TAU); ctx.fill();
+  ctx.fillStyle = shade(col, -0.28); rrect(2, hy + 6, 11, 1.4);
+  ctx.fillStyle = "#ffffff"; for (let i = 0; i < 4; i++) ctx.fillRect(4 + i * 2.4, hy + 6, 1.4, 1.6);
+  ctx.fillStyle = shade(col, -0.34); for (let i = 0; i < 3; i++) ctx.fillRect(-9 + i * 1.6, hy + 1, 1, 4);
+  // eyes + neon goggles
+  ctx.fillStyle = "#0e2c36"; rrect(-12, hy - 4, 24, 3);
+  ctx.fillStyle = shade(neon, 0.12); rrect(-12, hy - 4, 24, 1);
+  const ex1 = -3, ex2 = 5, eyy = hy - 1;
+  ctx.fillStyle = "#ffffff";
+  ctx.beginPath(); ctx.arc(ex1, eyy, 3.4, 0, TAU); ctx.fill();
+  ctx.beginPath(); ctx.arc(ex2, eyy, 3.4, 0, TAU); ctx.fill();
+  ctx.fillStyle = "#06202b";
+  ctx.beginPath(); ctx.arc(ex1 + 1, eyy, 1.7, 0, TAU); ctx.fill();
+  ctx.beginPath(); ctx.arc(ex2 + 1, eyy, 1.7, 0, TAU); ctx.fill();
+  ctx.fillStyle = "#cdf6ff"; ctx.fillRect(ex1, eyy - 1, 1, 1); ctx.fillRect(ex2, eyy - 1, 1, 1);
+  ctx.strokeStyle = neon; ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.arc(ex1, eyy, 4.2, 0, TAU); ctx.stroke();
+  ctx.beginPath(); ctx.arc(ex2, eyy, 4.2, 0, TAU); ctx.stroke();
+  ctx.fillStyle = neon; rrect(ex1 + 3.5, eyy - 0.5, 2, 1);
+  // front arm + seaweed wrist wrap
+  ctx.fillStyle = col; rrect(4, -15, 4, 7);
+  ctx.fillStyle = weed; rrect(4, -10, 4, 2);
+  ctx.fillStyle = belly; rrect(5, -9, 3, 3);
 }
 
 // Blaster made of coral/shell parts, drawn pointing along aim angle (in world).
@@ -2233,8 +2360,7 @@ function actionBtn(b, color, label, ready) {
   ctx.globalAlpha = 1;
 }
 function drawMobileControls() {
-  drawStick(moveStick, "#19e6ff");
-  drawStick(aimStick, "#ff3df0");
+  drawStick(moveStick, "#2ccada");
   actionBtn(btnShoot, PLAYER_COLOR, "FIRE", false);
   actionBtn(btnDive, "#3dff8a", "DIVE", false);
   const ultiReady = player.special >= 100;
@@ -2327,27 +2453,40 @@ function drawTitle() {
   ctx.fillStyle = "#7fb0c6"; ctx.font = Math.max(7, 8 * S) + "px monospace";
   ctx.fillText(isTouch ? "tap arrows to change" : "◀ ▶ / A D to change", cx, selY + selpx * 0.35 + 14 * S);
 
-  // --- pulsing start prompt ---
+  // --- buttons: PLAY (primary) + HOW TO PLAY / SETTINGS ---
   const pulse = 0.5 + 0.5 * Math.sin(bgT * 6);
-  const ppx = Math.max(12, 19 * S);
-  ctx.globalAlpha = 0.55 + pulse * 0.45;
-  ctx.fillStyle = "#fff"; ctx.font = "bold " + ppx + "px monospace";
-  ctx.fillText(isTouch ? "TAP TO START" : "CLICK or press ENTER", cx, py0 + panelH * 0.78);
-  ctx.globalAlpha = 1;
-
-  // --- controls + tagline (auto-fit so they never overflow) ---
-  const ctrl = isTouch
-    ? "Sticks: move / aim    Buttons: shoot · dive · ulti"
-    : "WASD move · Mouse aim · Click/Space shoot · Shift dive · Q ulti";
-  let cf = fitFont(ctrl, panelW * 0.92, 12 * S, "monospace");
-  ctx.font = cf + "px monospace"; ctx.fillStyle = "#9cc7da";
-  ctx.fillText(ctrl, cx, py0 + panelH * 0.88);
-  const tag = "Ink the most reef before the timer hits 0:00 to win!";
-  let tf = fitFont(tag, panelW * 0.92, 11 * S, "monospace");
-  ctx.font = tf + "px monospace"; ctx.fillStyle = "#7fb0c6";
-  ctx.fillText(tag, cx, py0 + panelH * 0.95);
+  const pbw = panelW * 0.5, pbh = 36 * S, pby = py0 + panelH * 0.76;
+  titleBtns.play = { x: cx - pbw / 2, y: pby, w: pbw, h: pbh };
+  drawBtn(titleBtns.play, "PLAY", PLAYER_COLOR, true, 18 * S, 0.85 + pulse * 0.15);
+  const sw = panelW * 0.44, gap = panelW * 0.04, sby = pby + pbh + 10 * S, sbh = 26 * S;
+  titleBtns.how = { x: cx - sw - gap / 2, y: sby, w: sw, h: sbh };
+  titleBtns.settings = { x: cx + gap / 2, y: sby, w: sw, h: sbh };
+  drawBtn(titleBtns.how, "HOW TO PLAY", "#7fb0c6", false, 11 * S);
+  drawBtn(titleBtns.settings, "SETTINGS", "#7fb0c6", false, 11 * S);
 
   ctx.textAlign = "left";
+}
+
+// Shared menu button: draws a rect + centered label and stores nothing (caller
+// keeps the rect for hit-testing). `filled` = solid accent, else outline.
+function drawBtn(r, label, col, filled, fs, alpha) {
+  ctx.save();
+  if (alpha != null) ctx.globalAlpha = alpha;
+  if (filled) {
+    ctx.fillStyle = col; rrect(r.x, r.y, r.w, r.h);
+    ctx.fillStyle = "rgba(255,255,255,0.25)"; rrect(r.x, r.y, r.w, Math.max(1, r.h * 0.18));
+    ctx.fillStyle = "#06202b";
+  } else {
+    ctx.fillStyle = "rgba(8,30,46,0.7)"; rrect(r.x, r.y, r.w, r.h);
+    ctx.strokeStyle = col; ctx.lineWidth = Math.max(1, fs * 0.12);
+    ctx.strokeRect(Math.round(r.x) + 0.5, Math.round(r.y) + 0.5, Math.round(r.w), Math.round(r.h));
+    ctx.fillStyle = col;
+  }
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.font = "bold " + Math.round(fs) + "px 'Trebuchet MS', sans-serif";
+  ctx.fillText(label, r.x + r.w / 2, r.y + r.h / 2 + 1);
+  ctx.textBaseline = "alphabetic"; ctx.textAlign = "left";
+  ctx.restore();
 }
 
 // Big chibi-shark mascot for the title, scaled by S (drawn around cx,cy)
@@ -2379,6 +2518,185 @@ function drawTitleShark(cx, cy, S) {
   ctx.fillStyle = dark; ctx.fillRect(14, -6, 20, 12);
   ctx.fillStyle = shade(ink, 0.4); ctx.fillRect(32, -6, 6, 12);
   ctx.restore();
+  ctx.restore();
+}
+
+/* ---------- WEAPON SELECT (character left, weapon carousel right) ---------- */
+function drawWeaponIcon(x, y, s, idx) {
+  ctx.save(); ctx.translate(x, y); ctx.scale(s, s);
+  const ink = PLAYER_COLOR, dark = PLAYER_BODY_DARK;
+  ctx.fillStyle = "#e3c79a"; ctx.fillRect(-11, -3, 9, 8);          // shell grip
+  const len = idx === 2 ? 22 : idx === 1 ? 12 : idx === 3 ? 10 : 16; // barrel length per weapon
+  ctx.fillStyle = dark; ctx.fillRect(-2, -4, len, 8);
+  ctx.fillStyle = "#f0e6d2"; ctx.fillRect(-2, -4, len, 2);
+  ctx.fillStyle = shade(ink, 0.35); ctx.fillRect(len - 3, -4, 4, 8); // muzzle glow
+  if (idx === 3) { ctx.fillStyle = ink; ctx.fillRect(len + 1, -7, 2, 2); ctx.fillRect(len + 1, -1, 2, 2); ctx.fillRect(len + 1, 5, 2, 2); }
+  if (idx === 2) { ctx.fillStyle = "#d98f86"; ctx.fillRect(-4, -6, 4, 12); } // cannon coral chunk
+  ctx.restore();
+}
+function drawWeaponSelect() {
+  const S = ovScale(), cx = VIEW_W / 2;
+  ctx.textAlign = "center"; ctx.textBaseline = "alphabetic";
+  ctx.fillStyle = PLAYER_COLOR; ctx.font = "bold " + Math.round(24 * S) + "px 'Trebuchet MS', sans-serif";
+  ctx.fillText("CHOOSE YOUR GEAR", cx, VIEW_H * 0.12);
+  ctx.fillStyle = "#7fb0c6"; ctx.font = "bold " + Math.round(10 * S) + "px monospace";
+  ctx.fillText("Stage: " + LAYOUT_NAMES[currentLayout], cx, VIEW_H * 0.12 + 16 * S);
+
+  // LEFT: character preview
+  const lpX = VIEW_W * 0.05, lpY = VIEW_H * 0.22, lpW = VIEW_W * 0.36, lpH = VIEW_H * 0.56;
+  hudPanel(lpX, lpY, lpW, lpH);
+  const cScale = Math.max(1.4, Math.min(lpW, lpH) / 70);
+  ctx.save();
+  ctx.translate(lpX + lpW / 2, lpY + lpH * 0.64);
+  ctx.scale(cScale, cScale);
+  drawChibiBody(PLAYER_BODY, PLAYER_BODY_DARK, PLAYER_COLOR, true, bgT * 2, false);
+  ctx.restore();
+  drawBlaster(lpX + lpW / 2 + 6 * cScale, lpY + lpH * 0.64 - 9 * cScale, -0.35, PLAYER_COLOR, PLAYER_BODY_DARK);
+  ctx.fillStyle = "#bfe9ff"; ctx.font = "bold " + Math.round(10 * S) + "px monospace"; ctx.textAlign = "center";
+  ctx.fillText("YOUR WARRIOR", lpX + lpW / 2, lpY + lpH - 10 * S);
+
+  // RIGHT: weapon card
+  const rX = VIEW_W * 0.44, rY = VIEW_H * 0.22, rW = VIEW_W * 0.51, rH = VIEW_H * 0.56;
+  hudPanel(rX, rY, rW, rH);
+  const w = WEAPONS[weaponSel];
+  ctx.textAlign = "center"; ctx.fillStyle = "#eaffff";
+  ctx.font = "bold " + Math.round(19 * S) + "px 'Trebuchet MS', sans-serif";
+  ctx.fillText(w.name, rX + rW / 2, rY + 28 * S);
+  drawWeaponIcon(rX + rW / 2, rY + rH * 0.30, 2.6 * S, weaponSel);
+  ctx.fillStyle = "#9cc7da"; ctx.font = Math.round(10 * S) + "px monospace";
+  ctx.fillText(w.desc, rX + rW / 2, rY + rH * 0.48);
+  // stat bars
+  const stats = [["DMG", w.dmg / 40], ["RANGE", w.range / 8.5], ["RATE", clamp((0.55 - w.cd) / 0.5, 0, 1)], ["COVER", w.splashR / 3.3]];
+  let syy = rY + rH * 0.55; const sbx = rX + rW * 0.36, sbw = rW * 0.48;
+  for (const st of stats) {
+    ctx.textAlign = "left"; ctx.fillStyle = "#7fb0c6"; ctx.font = "bold " + Math.round(9 * S) + "px monospace";
+    ctx.fillText(st[0], rX + rW * 0.14, syy + 7 * S);
+    hudBar(sbx, syy, sbw, 8 * S, st[1], PLAYER_COLOR);
+    syy += 15 * S;
+  }
+  // carousel arrows
+  const ar = 16 * S, arY = rY + rH * 0.30;
+  weaponUI.prev = { x: rX - ar, y: arY - ar, w: ar * 2.4, h: ar * 2.4 };
+  weaponUI.next = { x: rX + rW - ar * 1.4, y: arY - ar, w: ar * 2.4, h: ar * 2.4 };
+  ctx.fillStyle = PLAYER_COLOR;
+  poly(rX + 12 * S, arY, [[8 * S, -9 * S], [8 * S, 9 * S], [-6 * S, 0]]);
+  poly(rX + rW - 12 * S, arY, [[-8 * S, -9 * S], [-8 * S, 9 * S], [6 * S, 0]]);
+  // page dots
+  ctx.textAlign = "center";
+  for (let i = 0; i < WEAPONS.length; i++) {
+    ctx.fillStyle = i === weaponSel ? PLAYER_COLOR : "rgba(150,200,220,0.35)";
+    ctx.beginPath(); ctx.arc(rX + rW / 2 + (i - (WEAPONS.length - 1) / 2) * 12 * S, rY + rH - 14 * S, 3 * S, 0, TAU); ctx.fill();
+  }
+
+  // START + BACK
+  const bw = VIEW_W * 0.32, sx = cx - bw / 2;
+  weaponUI.start = { x: sx, y: VIEW_H * 0.85, w: bw, h: 34 * S };
+  drawBtn(weaponUI.start, "START!", "#3dff8a", true, 17 * S, 0.85 + 0.15 * Math.sin(bgT * 6));
+  weaponUI.back = { x: VIEW_W * 0.05, y: VIEW_H * 0.05, w: 66 * S, h: 24 * S };
+  drawBtn(weaponUI.back, "BACK", "#7fb0c6", false, 11 * S);
+  ctx.fillStyle = "#5a8aa0"; ctx.font = Math.round(8 * S) + "px monospace"; ctx.textAlign = "center";
+  ctx.fillText(isTouch ? "swipe / tap arrows to change weapon" : "A / D / arrows to change weapon", cx, VIEW_H * 0.85 - 8 * S);
+  ctx.textAlign = "left";
+}
+
+/* ---------- SETTINGS ---------- */
+function drawToggleRow(r, label, on, S) {
+  ctx.fillStyle = "rgba(8,30,46,0.7)"; rrect(r.x, r.y, r.w, r.h);
+  ctx.strokeStyle = "rgba(40,196,228,0.5)"; ctx.lineWidth = Math.max(1, S);
+  ctx.strokeRect(Math.round(r.x) + 0.5, Math.round(r.y) + 0.5, Math.round(r.w), Math.round(r.h));
+  ctx.textBaseline = "middle"; ctx.textAlign = "left";
+  ctx.fillStyle = "#cfe9ff"; ctx.font = "bold " + Math.round(12 * S) + "px monospace";
+  ctx.fillText(label, r.x + 12 * S, r.y + r.h / 2);
+  const pw = 46 * S, ph = 20 * S, px = r.x + r.w - pw - 12 * S, py = r.y + (r.h - ph) / 2;
+  ctx.fillStyle = on ? "#1f6e42" : "#5a2c34"; rrect(px, py, pw, ph);
+  const knob = ph - 4;
+  ctx.fillStyle = on ? "#3dff8a" : "#ff8a8a"; rrect(on ? px + pw - knob - 2 : px + 2, py + 2, knob, knob);
+  ctx.fillStyle = "#eaffff"; ctx.font = "bold " + Math.round(8 * S) + "px monospace"; ctx.textAlign = "center";
+  ctx.fillText(on ? "ON" : "OFF", on ? px + (pw - knob) / 2 : px + pw - (pw - knob) / 2, py + ph / 2);
+  ctx.textBaseline = "alphabetic"; ctx.textAlign = "left";
+}
+function drawSettings() {
+  const S = ovScale(), cx = VIEW_W / 2, cy = VIEW_H / 2;
+  const pw = Math.min(VIEW_W * 0.82, 340 * S), ph = Math.min(VIEW_H * 0.8, 250 * S);
+  hudPanel(cx - pw / 2, cy - ph / 2, pw, ph);
+  ctx.textAlign = "center"; ctx.fillStyle = PLAYER_COLOR; ctx.font = "bold " + Math.round(26 * S) + "px 'Trebuchet MS'";
+  ctx.fillText("SETTINGS", cx, cy - ph / 2 + 38 * S);
+  const rw = pw * 0.78, rx = cx - rw / 2, rh = 34 * S; let ry = cy - ph * 0.10;
+  settingsUI.music = { x: rx, y: ry, w: rw, h: rh }; drawToggleRow(settingsUI.music, "MUSIC", settings.music, S); ry += rh + 14 * S;
+  settingsUI.sfx = { x: rx, y: ry, w: rw, h: rh }; drawToggleRow(settingsUI.sfx, "SOUND FX", settings.sfx, S);
+  settingsUI.back = { x: cx - 52 * S, y: cy + ph / 2 - 40 * S, w: 104 * S, h: 28 * S };
+  drawBtn(settingsUI.back, "BACK", "#7fb0c6", false, 12 * S);
+  ctx.textAlign = "left";
+}
+
+/* ---------- HOW TO PLAY ---------- */
+function drawHowTo() {
+  const S = ovScale(), cx = VIEW_W / 2;
+  const pw = Math.min(VIEW_W * 0.88, 480 * S), ph = Math.min(VIEW_H * 0.88, 380 * S);
+  const x0 = cx - pw / 2, y0 = VIEW_H / 2 - ph / 2;
+  hudPanel(x0, y0, pw, ph);
+  ctx.textAlign = "center"; ctx.fillStyle = PLAYER_COLOR; ctx.font = "bold " + Math.round(24 * S) + "px 'Trebuchet MS'";
+  ctx.fillText("HOW TO PLAY", cx, y0 + 34 * S);
+  const rows = [
+    ["PAINT", "Ink the reef — most coverage at 0:00 wins."],
+    ["MOVE", isTouch ? "Left stick moves; aim follows you." : "WASD / arrows to move, mouse to aim."],
+    ["FIRE", isTouch ? "FIRE button (auto-aims nearby rivals)." : "Click or Space to shoot."],
+    ["DIVE", isTouch ? "DIVE on your own ink: faster + hidden." : "Shift on your own ink: faster + hidden."],
+    ["SPECIAL", isTouch ? "Fill meter, tap ULTI for an Ink Storm." : "Fill meter, press Q for an Ink Storm."],
+    ["PICKUPS", "Grab Ink / Speed / Shield / Special — rivals want them too."],
+  ];
+  let yy = y0 + 58 * S; const lh = Math.min(42 * S, (ph - 96 * S) / rows.length);
+  const keyX = x0 + pw * 0.05, valX = x0 + pw * 0.30, maxW = pw * 0.66;
+  for (const row of rows) {
+    ctx.textAlign = "left"; ctx.fillStyle = PLAYER_COLOR; ctx.font = "bold " + Math.round(11 * S) + "px monospace";
+    ctx.fillText(row[0], keyX, yy + 8 * S);
+    let fs = 10 * S; ctx.font = Math.round(fs) + "px monospace";
+    while (ctx.measureText(row[1]).width > maxW && fs > 7) { fs--; ctx.font = Math.round(fs) + "px monospace"; }
+    ctx.fillStyle = "#cfe9ff"; ctx.fillText(row[1], valX, yy + 8 * S);
+    yy += lh;
+  }
+  howtoUI.back = { x: cx - 52 * S, y: y0 + ph - 36 * S, w: 104 * S, h: 26 * S };
+  drawBtn(howtoUI.back, "BACK", "#7fb0c6", false, 11 * S);
+  ctx.textAlign = "left";
+}
+
+// Big centered "3 · 2 · 1 · GO!" intro overlay
+function drawCountdown() {
+  const S = ovScale(), cd = game.countdown;
+  const cx = VIEW_W / 2, cy = VIEW_H * 0.42;
+
+  // match-intro banner ("TURF WAR — <Stage>") that slides in then out
+  const bannerA = cd > 0 ? clamp((3 - cd) * 2.5, 0, 1) : clamp(1 + cd / 0.7, 0, 1);
+  if (bannerA > 0.01) {
+    ctx.save(); ctx.globalAlpha = bannerA;
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#ffd23d"; ctx.font = "bold " + Math.round(20 * S) + "px 'Trebuchet MS', sans-serif";
+    ctx.fillText("TURF WAR", cx, VIEW_H * 0.22);
+    ctx.fillStyle = "#cfe9ff"; ctx.font = "bold " + Math.round(12 * S) + "px monospace";
+    ctx.fillText(LAYOUT_NAMES[currentLayout], cx, VIEW_H * 0.22 + 18 * S);
+    ctx.restore(); ctx.textAlign = "left";
+  }
+
+  let label, col, scale, alpha;
+  if (cd > 0) {
+    label = String(Math.ceil(cd));
+    col = "#eaffff";
+    const age = clamp(Math.ceil(cd) - cd, 0, 1);   // 0 = just popped in
+    scale = 1.5 - 0.5 * age;                        // pop big then settle
+    alpha = 1;
+  } else {
+    label = "GO!";
+    col = "#3dff8a";
+    alpha = clamp(1 + cd / 0.7, 0, 1);             // fade out over ~0.7s
+    scale = 1.2 + (-cd) * 0.9;                      // and zoom out
+  }
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.font = "bold " + Math.round(74 * S * scale) + "px 'Trebuchet MS', sans-serif";
+  ctx.fillStyle = "rgba(3,12,24,0.55)"; ctx.fillText(label, cx + 3 * S, cy + 3 * S);
+  ctx.fillStyle = col; ctx.fillText(label, cx, cy);
+  ctx.globalAlpha = 1; ctx.textBaseline = "alphabetic"; ctx.textAlign = "left";
   ctx.restore();
 }
 
@@ -2467,7 +2785,7 @@ function frame(now) {
 
   update(dt);
   render();
-  present();   // blit the low-res buffer to the screen, crisp nearest-neighbour
+  updateMusic();   // schedule background-music notes (no-op if muted)
   requestAnimationFrame(frame);
 }
 
