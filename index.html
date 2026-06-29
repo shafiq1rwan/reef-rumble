@@ -46,6 +46,8 @@
 <canvas id="game"></canvas>
 <div id="rotateHint">🦈 Rotate your device to <b>landscape</b> for the best reef battle!</div>
 
+<!-- PeerJS (bundled locally) — powers the room-code online multiplayer -->
+<script src="vendor/peerjs.min.js"></script>
 <script>
 "use strict";
 /* ============================================================================
@@ -130,25 +132,32 @@ const PALETTES = {
     { ink: "#b266ff", dark: "#6f33b0", body: "#cd9bff" },
   ] },
 };
-let PLAYER_COLOR      = PALETTES.normal.player;   // cyan sea-ink (projectiles/tiles/UI)
+let PLAYER_COLOR      = PALETTES.normal.player;   // faction 0 ink (you) — used in UI
 let PLAYER_COLOR_DARK = PALETTES.normal.dark;
 let ENEMY_COLORS = PALETTES.normal.enemies.map(e => ({ ...e }));
-let GANG_BY_INK = {};                              // ink colour -> gang index
+// 4 factions: 0 = you (cyan/blue), 1-3 = rival gangs. Each { ink, dark, body }.
+let FACTION_COLORS = [];
+let localFaction = 0;   // which faction this client controls (0 in solo/host)
+function buildFactionColors() {
+  FACTION_COLORS = [
+    { ink: PLAYER_COLOR, dark: PLAYER_COLOR_DARK, body: PLAYER_BODY },
+    ...ENEMY_COLORS.map(e => ({ ...e })),
+  ];
+}
 function applyPalette() {
   const pal = (settings.colorblind) ? PALETTES.cb : PALETTES.normal;
-  const oldByInk = GANG_BY_INK;
-  // remap any already-painted tiles so a mid-match toggle stays consistent
-  try {
-    if (map && map.length) for (const t of map) {
-      if (t.owner === OWN_PLAYER) t.inkColor = pal.player;
-      else if (t.owner === OWN_ENEMY) { const gi = oldByInk[t.inkColor]; if (gi != null) t.inkColor = pal.enemies[gi].ink; }
-    }
-  } catch (e) { /* map not built yet */ }
   PLAYER_COLOR = pal.player; PLAYER_COLOR_DARK = pal.dark;
   ENEMY_COLORS = pal.enemies.map(e => ({ ...e }));
-  GANG_BY_INK = {}; ENEMY_COLORS.forEach((c, i) => { GANG_BY_INK[c.ink] = i; });
+  buildFactionColors();
+  // recolor any already-painted tiles + sharks so a mid-match toggle stays consistent
+  try {
+    if (map && map.length) for (const t of map) {
+      if (t.team >= 0) t.inkColor = FACTION_COLORS[t.team].ink;
+    }
+  } catch (e) { /* map not built yet */ }
+  try { for (const sh of sharks) { const fc = FACTION_COLORS[sh.faction]; sh.color = fc.ink; sh.dark = fc.dark; sh.body = fc.body; } } catch (e) {}
 }
-ENEMY_COLORS.forEach((c, i) => { GANG_BY_INK[c.ink] = i; });   // initial (normal) map
+buildFactionColors();   // initial (normal) palette
 
 // Decoration sub-types for obstacles (visual only)
 const D_CORAL = 0, D_ROCK = 1, D_CRATE = 2, D_SIGN = 3, D_BARRIER = 4;
@@ -357,8 +366,9 @@ let mouseDown = false;
 let usingMouse = false;
 
 // menu hit-rects (filled in each frame by the matching draw function)
-const titleBtns   = { play: null, how: null, settings: null, credits: null };
+const titleBtns   = { play: null, multi: null, how: null, settings: null, credits: null };
 const creditsUI   = { back: null };
+const lobbyUI     = { host: null, join: null, back: null, start: null, ready: null, leave: null };
 const weaponUI    = { prev: null, next: null, start: null, back: null };
 const settingsUI  = { music: null, sfx: null, colorblind: null, back: null };
 const howtoUI     = { back: null };
@@ -385,13 +395,14 @@ window.addEventListener("keydown", e => {
   if ([" ", "arrowup", "arrowdown", "arrowleft", "arrowright"].includes(k)) e.preventDefault();
   // global hotkeys
   if (e.key === "Enter") handleEnter();
-  if (k === "p" && (game.state === "PLAYING" || game.state === "PAUSED"))
-    game.state = (game.state === "PLAYING") ? "PAUSED" : "PLAYING";
+  if (k === "p" && !net.role && (game.state === "PLAYING" || game.state === "PAUSED"))
+    game.state = (game.state === "PLAYING") ? "PAUSED" : "PLAYING";   // pause is solo-only
   if (k === "q" || k === "e") tryUlti();   // SPECIAL / ULTI
   if (k === "escape") {
     if (game.state === "SETTINGS") game.state = settingsFrom;
     else if (game.state === "WEAPONSELECT" || game.state === "HOWTO" || game.state === "CREDITS") game.state = "TITLE";
-    else if (game.state === "PLAYING") game.state = "PAUSED";
+    else if (game.state === "LOBBY") { netReset(); game.state = "TITLE"; }
+    else if (game.state === "PLAYING" && !net.role) game.state = "PAUSED";
   }
   // left/right: stage on title, weapon on the select screen
   if (k === "arrowleft" || k === "a") { if (game.state === "TITLE") cycleLayout(-1); else if (game.state === "WEAPONSELECT") cycleWeapon(-1); }
@@ -412,7 +423,7 @@ canvas.addEventListener("mousedown", e => {
   if (updateReady && inR(p, toastRect)) { applyUpdate(); return; }
   if (game.state === "PLAYING") {
     const pbq = pauseBtn();
-    if (inCircle(p.x, p.y, pbq.x, pbq.y, pbq.r + 8)) { game.state = "PAUSED"; return; }
+    if (!net.role && inCircle(p.x, p.y, pbq.x, pbq.y, pbq.r + 8)) { game.state = "PAUSED"; return; }
     mouseDown = true;   // hold to fire
     return;
   }
@@ -428,8 +439,12 @@ function menuTap(p) {
       if (titleArrowHit(p)) return;
       if (inR(p, titleBtns.credits)) { sfx("ui"); game.state = "CREDITS"; }
       else if (inR(p, titleBtns.play)) { sfx("ui"); game.state = "WEAPONSELECT"; }
+      else if (inR(p, titleBtns.multi)) { sfx("ui"); netReset(); net.status = ""; game.state = "LOBBY"; }
       else if (inR(p, titleBtns.how)) { sfx("ui"); game.state = "HOWTO"; }
       else if (inR(p, titleBtns.settings)) { sfx("ui"); settingsFrom = "TITLE"; game.state = "SETTINGS"; }
+      return;
+    case "LOBBY":
+      lobbyTap(p);
       return;
     case "CREDITS":
       game.state = "TITLE"; sfx("ui"); return;   // tap anywhere / BACK closes
@@ -448,6 +463,7 @@ function menuTap(p) {
     case "HOWTO":
       game.state = "TITLE"; sfx("ui"); return;   // tap anywhere closes
     case "GAMEOVER": case "VICTORY":
+      if (net.role) netReset();
       game.state = "TITLE"; return;
     case "PAUSED": {
       if (inR(p, pauseUI.resume)) { sfx("ui"); game.state = "PLAYING"; }
@@ -462,7 +478,7 @@ function handleEnter() {
   else if (game.state === "WEAPONSELECT") startMatch();
   else if (game.state === "SETTINGS") game.state = settingsFrom;
   else if (game.state === "HOWTO" || game.state === "CREDITS") game.state = "TITLE";
-  else if (game.state === "GAMEOVER" || game.state === "VICTORY") game.state = "TITLE";
+  else if (game.state === "GAMEOVER" || game.state === "VICTORY") { if (net.role) netReset(); game.state = "TITLE"; }
 }
 
 // Title-screen stage selector (positions filled in by drawTitle each frame)
@@ -542,9 +558,9 @@ function onTouchStart(e) {
       menuTap(p);
       return;
     }
-    // pause button (top-right)
+    // pause button (top-right) — solo only (host-authoritative MP can't pause)
     const pbq = pauseBtn();
-    if (inCircle(p.x, p.y, pbq.x, pbq.y, pbq.r + 10)) { game.state = "PAUSED"; return; }
+    if (!net.role && inCircle(p.x, p.y, pbq.x, pbq.y, pbq.r + 10)) { game.state = "PAUSED"; return; }
     // small action buttons first (ULTI / DIVE)
     if (inCircle(p.x, p.y, btnUlti.x, btnUlti.y, btnUlti.r + 8)) { btnUlti.id = t.identifier; btnUlti.pressed = true; tryUlti(); continue; }
     if (inCircle(p.x, p.y, btnDive.x, btnDive.y, btnDive.r + 8)) { btnDive.id = t.identifier; btnDive.pressed = true; continue; }
@@ -646,7 +662,7 @@ function generateMap(layout) {
     for (let x = 0; x < MAP_W; x++) {
       map.push({
         x, y, terrain: T_FLOOR, deco: -1, height: 1,
-        owner: OWN_NONE, ink: 0, inkColor: null,
+        team: -1, ink: 0, inkColor: null,   // team: -1 none, 0-3 faction
         pulse: 0, tint: (x + y) & 1,   // checkerboard tile shading
       });
     }
@@ -782,16 +798,16 @@ function countPaintable() {
    ============================================================ */
 // Projectile pool
 const projectiles = [];
-function spawnProjectile(x, y, dx, dy, owner, color, dark, speed, range, fromPlayer) {
+function spawnProjectile(x, y, dx, dy, faction, color, dark, speed, range) {
   let p = projectiles.find(o => !o.alive);
   if (!p) { p = {}; projectiles.push(p); }
   p.alive = true; p.x = x; p.y = y; p.dx = dx; p.dy = dy;
-  p.owner = owner; p.color = color; p.dark = dark;
+  p.faction = faction; p.color = color; p.dark = dark;
   p.speed = speed; p.range = range; p.travelled = 0;
-  p.fromPlayer = fromPlayer; p.r = 0.28; p.spin = rand(0, TAU);
-  // damage / paint defaults (player weapons override these after spawning)
-  p.directDmg = fromPlayer ? 26 : 14;
-  p.splashDmg = fromPlayer ? 14 : 8;
+  p.r = 0.28; p.spin = rand(0, TAU);
+  // damage / paint defaults (a shooter's weapon overrides these after spawning)
+  p.directDmg = 14;
+  p.splashDmg = 8;
   p.splashR = SPLASH_RADIUS;
   return p;
 }
@@ -812,48 +828,37 @@ function spawnFloater(x, y, text, color) {
   floaters.push({ x, y, text, color, life: 1.0 });
 }
 
-function makePlayer() {
+// Unified shark factory — any faction can be the local player (needed in MP).
+// Humans get 100 HP, bots 60 (keeps solo identical: you=100, gangs=60).
+function makeShark(faction, isBot) {
+  const fc = FACTION_COLORS[faction];
+  const s = faction === 0 ? PLAYER_SPAWN : (ENEMY_SPAWNS[faction - 1] || { x: 4, y: 4 });
+  const maxHp = isBot ? ENEMY_MAX_HP : PLAYER_MAX_HP;
   return {
-    x: PLAYER_SPAWN.x, y: PLAYER_SPAWN.y,
-    vx: 0, vy: 0,
-    aim: 0,                 // radians
-    hp: PLAYER_MAX_HP,
-    ink: INK_MAX,
-    diving: false, wasDiving: false,
-    speed: 0,
-    iframe: 0,
-    shootCd: 0,
-    dead: false, respawn: 0,
-    squash: 0,              // squash/stretch animation
-    facing: 1,              // 1 = right-ish, -1 = left-ish (for blaster flip)
-    walkPhase: 0,
-    score: 0,
-    kills: 0,
-    special: 0,             // 0..100 SPECIAL / ULTI meter ("INK STORM")
-    ultiFlash: 0,
-    speedBoost: 0,          // power-up timers (seconds)
-    shield: 0,
-  };
-}
-
-function makeEnemy(idx) {
-  const gang = ENEMY_COLORS[idx % ENEMY_COLORS.length];
-  const s = ENEMY_SPAWNS[idx % ENEMY_SPAWNS.length] || { x: 4, y: 4 };
-  return {
+    faction, isBot, id: faction - 1, maxHp,
+    color: fc.ink, dark: fc.dark, body: fc.body,
     x: s.x, y: s.y, vx: 0, vy: 0, aim: 0,
-    hp: ENEMY_MAX_HP, ink: INK_MAX, diving: false,
-    gang, color: gang.ink, dark: gang.dark, body: gang.body,
-    state: "PAINT", stateTimer: rand(1,3),
-    targetX: s.x, targetY: s.y,
-    shootCd: rand(0.3, 1.2),
-    dead: false, respawn: 0, iframe: 0,
+    hp: maxHp, ink: INK_MAX,
+    diving: false, wasDiving: false,
+    speed: 0, iframe: 0, shootCd: 0,
+    dead: false, respawn: 0,
     squash: 0, facing: 1, walkPhase: 0,
+    score: 0, kills: 0,
+    special: 0, ultiFlash: 0,
+    speedBoost: 0, shield: 0, popIn: 0,
+    weaponIdx: 0, weapon: WEAPONS[0],
     spawn: [s.x, s.y],
-    id: idx,
-    path: null, pathIdx: 0, pathCd: 0, pgx: -1, pgy: -1,  // A* navigation
-    speedBoost: 0, shield: 0,                              // power-up buffs
+    // AI fields (used when isBot)
+    state: "PAINT", stateTimer: rand(1, 3), targetX: s.x, targetY: s.y,
+    path: null, pathIdx: 0, pathCd: 0, pgx: -1, pgy: -1,
+    // per-frame input for human-controlled factions (host injects this in MP)
+    netInput: null,
+    // interpolation targets (clients lerp toward these from snapshots)
+    netX: s.x, netY: s.y, netAim: 0,
   };
 }
+function makePlayer() { return makeShark(0, false); }
+function makeEnemy(idx) { return makeShark(idx + 1, true); }
 
 /* A* on the tile grid (4-neighbour, Manhattan heuristic). Returns an array of
    {x,y} tile steps from start to goal (excluding start), or null if no path.
@@ -907,21 +912,60 @@ const game = {
   shakeX: 0, shakeY: 0,
   flash: 0,
   countdown: -1,      // start-of-match 3-2-1-GO timer (>-0.7 = showing)
-  pct: { player: 0, enemy: 0, gangs: [0, 0, 0] },
+  pct: { factions: [0, 0, 0, 0] },   // territory % per faction (0=you,1-3=gangs)
   result: null,
 };
 let player = makePlayer();
 let enemies = [];
+let sharks = [];      // [player, ...enemies] — uniform list of all 4 factions
+let netDirty = null;  // (MP host) Set of tile indices painted since last snapshot
+
+// ---- multiplayer / network state (see NETWORK section) ----
+const net = {
+  role: null,          // null=solo, "host", or "client"
+  peer: null,          // PeerJS Peer
+  conns: [],           // (host) DataConnections to each joined client
+  hostConn: null,      // (client) DataConnection to the host
+  roomCode: null,      // shared room code (host's peer id)
+  status: "",          // lobby status / error line
+  mode: null,          // lobby sub-screen: null | "host" | "join"
+  players: [],         // lobby roster: [{faction, name, ready, isLocal}]
+  factionConn: {},     // (host) faction id -> DataConnection
+  ultiPending: false,  // (client) edge-triggered ulti to send next input
+  snapAccum: 0,        // (host) snapshot send timer
+  inputAccum: 0,       // (client) input send timer
+  lastSnap: null,      // (client) most recent snapshot to apply
+  started: false,      // match has begun
+};
 
 const camera = { x: 0, y: 0, tx: 0, ty: 0 };
 
-function startMatch() {
+// Start a match. opts (multiplayer):
+//   localFaction : which faction this client renders/controls (default 0)
+//   humans       : Set/array of faction ids that are human-controlled (rest = bots)
+//   weapons      : { faction: weaponIdx } overrides (host syncs everyone's pick)
+//   stage        : layout index to load (host syncs it)
+//   netRole      : "host" | "client" (omitted = solo)
+function startMatch(opts) {
+  opts = opts || {};
   initAudio();
-  generateMap();
+  generateMap(opts.stage != null ? opts.stage : undefined);
   countPaintable();
-  player = makePlayer();
-  player.weapon = WEAPONS[weaponSel]; player.weaponIdx = weaponSel;   // equip the chosen weapon
-  enemies = [makeEnemy(0), makeEnemy(1), makeEnemy(2)];
+  localFaction = opts.localFaction || 0;
+  const humanSet = opts.humans ? new Set(opts.humans) : new Set([0]);  // solo: only you
+  const weaps = opts.weapons || {};
+  // build all 4 factions; index of array == faction id
+  const all = [];
+  for (let f = 0; f < 4; f++) {
+    const isBot = !humanSet.has(f);
+    const sh = makeShark(f, isBot);
+    const wi = (weaps[f] != null) ? weaps[f] : (f === localFaction ? weaponSel : 0);
+    sh.weaponIdx = wi; sh.weapon = WEAPONS[wi] || WEAPONS[0];
+    all.push(sh);
+  }
+  player = all[localFaction];           // the local human's shark (camera/HUD/input)
+  enemies = all.filter(s => s !== player);
+  sharks = all;                          // all 4 factions, indexable by faction id
   projectiles.length = 0; particles.length = 0; floaters.length = 0; impacts.length = 0;
   pickups.length = 0; pickupTimer = 4; flashes.length = 0; auras.length = 0; inkStorm = null;
   game.time = MATCH_TIME;
@@ -936,17 +980,15 @@ function startMatch() {
   const sp = worldToScreen(player.x, player.y);
   camera.x = camera.tx = sp.x; camera.y = camera.ty = sp.y;
   // paint small starting puddles under each shark so dive works immediately
-  paintTiles(player.x, player.y, 2.2, OWN_PLAYER, PLAYER_COLOR);
-  for (const e of enemies) paintTiles(e.x, e.y, 2.0, OWN_ENEMY, e.color);
+  for (const sh of sharks) paintTiles(sh.x, sh.y, sh === player ? 2.2 : 2.0, sh.faction, sh.color);
 }
 
 /* ============================================================
    9. PLAYER LOGIC
    ============================================================ */
-function speedForTile(ent, owner, diving) {
-  const ownsHere = (owner === OWN_PLAYER && ent === player) ||
-                   (owner === OWN_ENEMY && ent !== player);
-  const enemyHere = owner !== OWN_NONE && !ownsHere;
+function speedForTile(ent, tileTeam, diving) {
+  const ownsHere = (tileTeam === ent.faction);
+  const enemyHere = (tileTeam >= 0 && !ownsHere);
   if (diving && ownsHere) return PLAYER_SPEED_DIVE;
   if (ownsHere) return PLAYER_SPEED_OWN_INK;
   if (enemyHere) return PLAYER_SPEED_ENEMY_INK;
@@ -989,10 +1031,10 @@ function updatePlayer(dt) {
   if (player.dead) {
     player.respawn -= dt;
     if (player.respawn <= 0) {
-      player.dead = false; player.hp = PLAYER_MAX_HP; player.ink = INK_MAX;
+      player.dead = false; player.hp = player.maxHp || PLAYER_MAX_HP; player.ink = INK_MAX;
       player.x = PLAYER_SPAWN.x; player.y = PLAYER_SPAWN.y; player.iframe = PLAYER_IFRAMES * 1.5;
-      paintTiles(player.x, player.y, 2.0, OWN_PLAYER, PLAYER_COLOR);
-      respawnFX(player, PLAYER_COLOR);   // pop back in
+      paintTiles(player.x, player.y, 2.0, player.faction, player.color);
+      respawnFX(player, player.color);   // pop back in
     }
     return;
   }
@@ -1014,17 +1056,17 @@ function updatePlayer(dt) {
   const inMag = Math.min(1, Math.hypot(ix, iy));
 
   const tHere = tileAt(Math.floor(player.x), Math.floor(player.y));
-  const ownerHere = tHere ? tHere.owner : OWN_NONE;
+  const teamHere = tHere ? tHere.team : -1;
 
   // --- dive logic ---
   const wantDive = keys["shift"] || btnDive.pressed;
-  const onOwnInk = ownerHere === OWN_PLAYER;
+  const onOwnInk = teamHere === player.faction;
   if (wantDive && onOwnInk) player.diving = true;
   if (!wantDive || !onOwnInk) player.diving = false;
   if (player.diving && !player.wasDiving) sfx("dive");
   player.wasDiving = player.diving;
 
-  player.speed = speedForTile(player, ownerHere, player.diving);
+  player.speed = speedForTile(player, teamHere, player.diving);
   if (player.speedBoost > 0) player.speed *= 1.4;   // SPEED power-up
   const sp = player.speed * inMag;
   player.vx = wx * sp; player.vy = wy * sp;
@@ -1079,11 +1121,11 @@ function updatePlayer(dt) {
       const spreadOff = wpn.pellets > 1 ? (i - (wpn.pellets - 1) / 2) * wpn.spread : 0;
       const ang = player.aim + spreadOff + rand(-wpn.spread, wpn.spread) * (wpn.pellets > 1 ? 0.3 : 1);
       const dx = Math.cos(ang), dy = Math.sin(ang);
-      const pr = spawnProjectile(player.x + dx * 0.4, player.y + dy * 0.4, dx, dy, OWN_PLAYER, PLAYER_COLOR, PLAYER_COLOR_DARK, wpn.speed, wpn.range, true);
+      const pr = spawnProjectile(player.x + dx * 0.4, player.y + dy * 0.4, dx, dy, player.faction, player.color, player.dark, wpn.speed, wpn.range);
       pr.directDmg = wpn.dmg; pr.splashDmg = wpn.splashDmg; pr.splashR = wpn.splashR; pr.r = wpn.big ? 0.42 : 0.28;
     }
     const fa = player.aim;
-    addFlash(player.x + Math.cos(fa) * 0.45, player.y + Math.sin(fa) * 0.45, fa, PLAYER_COLOR);
+    addFlash(player.x + Math.cos(fa) * 0.45, player.y + Math.sin(fa) * 0.45, fa, player.color);
     sfx("shoot");
   }
 
@@ -1091,10 +1133,10 @@ function updatePlayer(dt) {
   if (player.ultiFlash > 0) player.ultiFlash -= dt;
 
   // --- ink recharge ---
-  rechargeInk(player, ownerHere === OWN_PLAYER, ownerHere, dt);
+  rechargeInk(player, teamHere === player.faction, teamHere, dt);
 
   // --- enemy-ink damage over time ---
-  if (ownerHere === OWN_ENEMY && !player.diving) {
+  if (teamHere >= 0 && teamHere !== player.faction && !player.diving) {
     damagePlayer(dt * 4, true);
   }
 
@@ -1106,9 +1148,94 @@ function updatePlayer(dt) {
   player.squash = lerp(player.squash, 0, dt * 10);
 }
 
-function rechargeInk(ent, onOwn, ownerHere, dt) {
+// (MP host) Drive a remote human faction's shark from its latest net input,
+// instead of the AI. Mirrors updatePlayer's movement/aim/shoot/dive/recharge but
+// reads e.netInput = { ix, iy, aim, fire, dive, ulti } and avoids camera/mouse.
+function driveHumanShark(e, dt) {
+  if (e.dead) {
+    e.respawn -= dt;
+    if (e.respawn <= 0) {
+      e.dead = false; e.hp = e.maxHp || PLAYER_MAX_HP; e.ink = INK_MAX;
+      e.x = e.spawn[0]; e.y = e.spawn[1]; e.iframe = PLAYER_IFRAMES * 1.5;
+      paintTiles(e.x, e.y, 2.0, e.faction, e.color);
+      respawnFX(e, e.color);
+    }
+    return;
+  }
+  const inp = e.netInput || { ix: 0, iy: 0, aim: e.aim, fire: false, dive: false, ulti: false };
+
+  // movement (screen-axis input -> world axis, same transform as the player)
+  let ix = inp.ix || 0, iy = inp.iy || 0;
+  let wx = (ix + iy), wy = (iy - ix);
+  const il = Math.hypot(wx, wy);
+  if (il > 0.001) { wx /= il; wy /= il; }
+  const inMag = Math.min(1, Math.hypot(ix, iy));
+
+  const tHere = tileAt(Math.floor(e.x), Math.floor(e.y));
+  const teamHere = tHere ? tHere.team : -1;
+  const onOwnInk = teamHere === e.faction;
+
+  // dive
+  const wantDive = !!inp.dive;
+  if (wantDive && onOwnInk) e.diving = true;
+  if (!wantDive || !onOwnInk) e.diving = false;
+
+  e.speed = speedForTile(e, teamHere, e.diving);
+  if (e.speedBoost > 0) e.speed *= 1.4;
+  const sp = e.speed * inMag;
+  e.vx = wx * sp; e.vy = wy * sp;
+  if (il > 0.001) {
+    moveEntity(e, e.vx, e.vy, dt);
+    e.walkPhase += dt * 10;
+  }
+
+  // aim comes resolved from the client
+  if (typeof inp.aim === "number") e.aim = inp.aim;
+  const scr = worldToScreen(Math.cos(e.aim), Math.sin(e.aim));
+  e.facing = scr.x >= 0 ? 1 : -1;
+
+  // shooting (selected weapon)
+  const wpn = e.weapon || WEAPONS[0];
+  e.shootCd -= dt;
+  if (inp.fire && !e.diving && e.shootCd <= 0 && e.ink >= wpn.cost) {
+    e.shootCd = wpn.cd;
+    e.ink -= wpn.cost;
+    e.special = Math.min(100, e.special + 1.3);
+    e.squash = -0.5;
+    for (let i = 0; i < wpn.pellets; i++) {
+      const spreadOff = wpn.pellets > 1 ? (i - (wpn.pellets - 1) / 2) * wpn.spread : 0;
+      const ang = e.aim + spreadOff + rand(-wpn.spread, wpn.spread) * (wpn.pellets > 1 ? 0.3 : 1);
+      const dx = Math.cos(ang), dy = Math.sin(ang);
+      const pr = spawnProjectile(e.x + dx * 0.4, e.y + dy * 0.4, dx, dy, e.faction, e.color, e.dark, wpn.speed, wpn.range);
+      pr.directDmg = wpn.dmg; pr.splashDmg = wpn.splashDmg; pr.splashR = wpn.splashR; pr.r = wpn.big ? 0.42 : 0.28;
+    }
+    addFlash(e.x + Math.cos(e.aim) * 0.45, e.y + Math.sin(e.aim) * 0.45, e.aim, e.color);
+    if (dist(e.x, e.y, player.x, player.y) < 11) sfx("shoot");
+  }
+
+  if (inp.ulti) doUlti(e);
+  if (e.ultiFlash > 0) e.ultiFlash -= dt;
+
+  rechargeInk(e, onOwnInk, teamHere, dt);
+  // standing on rival ink chips HP (no hit-flash spam — direct, like the player)
+  if (teamHere >= 0 && teamHere !== e.faction && !e.diving && e.shield <= 0) {
+    e.hp -= dt * 4;
+    if (e.hp <= 0 && !e.dead) {
+      e.hp = 0; e.dead = true; e.respawn = RESPAWN_DELAY; e.diving = false;
+      deathBurst(e.x, e.y, e.color); sfx("splat");
+    }
+  }
+
+  if (e.iframe > 0) e.iframe -= dt;
+  if (e.speedBoost > 0) e.speedBoost -= dt;
+  if (e.shield > 0) e.shield -= dt;
+  if (e.popIn > 0) e.popIn -= dt;
+  e.squash = lerp(e.squash, 0, dt * 10);
+}
+
+function rechargeInk(ent, onOwn, tileTeam, dt) {
   if (onOwn) ent.ink += (ent.diving ? 60 : 22) * dt;
-  else if (ownerHere === OWN_NONE) ent.ink += 5 * dt;
+  else if (tileTeam === -1) ent.ink += 5 * dt;   // neutral ground: slow trickle
   // enemy ink: no recharge
   ent.ink = clamp(ent.ink, 0, INK_MAX);
 }
@@ -1160,44 +1287,52 @@ function damagePlayer(amount, fromInk) {
   }
   if (player.hp <= 0 && !player.dead) {
     player.hp = 0; player.dead = true; player.respawn = RESPAWN_DELAY; player.diving = false;
-    deathBurst(player.x, player.y, PLAYER_COLOR);
+    deathBurst(player.x, player.y, player.color);
     game.flash = 0.55;            // red wipeout flash
     sfx("splat");
   }
 }
 
 /* SPECIAL / ULTI — "INK STORM": when the meter is full, blast a huge ring of
-   player ink around the shark, damage nearby rivals, and refill the ink tank. */
-function tryUlti() {
-  if (game.state !== "PLAYING" || player.dead || player.diving) return;
-  if (player.special < 100) return;
-  player.special = 0;
-  player.ink = INK_MAX;
-  player.ultiFlash = 0.4;
-  player.iframe = Math.max(player.iframe, 0.5); // brief safety on cast
-  game.shake = Math.min(14, game.shake + 11);
+   ink around the shark, damage nearby rivals, and refill the ink tank. Works for
+   any faction's shark so the host can resolve a remote human's ulti too. */
+function doUlti(sh) {
+  if (sh.dead || sh.diving || sh.special < 100) return;
+  sh.special = 0;
+  sh.ink = INK_MAX;
+  sh.ultiFlash = 0.4;
+  sh.iframe = Math.max(sh.iframe, 0.5); // brief safety on cast
+  if (dist(sh.x, sh.y, player.x, player.y) < 16) game.shake = Math.min(14, game.shake + 11);
   // big paint burst in expanding rings
-  for (let r = 1.4; r <= 5.0; r += 0.7) paintTiles(player.x, player.y, r, OWN_PLAYER, PLAYER_COLOR);
-  // damage + knock enemies in range
-  for (const e of enemies)
-    if (!e.dead && dist(player.x, player.y, e.x, e.y) < 5.0) damageEnemy(e, 45);
-  startInkStorm(player.x, player.y);
-  spawnFloater(player.x, player.y - 1.8, "INK STORM!", PLAYER_COLOR);
+  for (let r = 1.4; r <= 5.0; r += 0.7) paintTiles(sh.x, sh.y, r, sh.faction, sh.color);
+  // damage + knock rival-faction sharks in range
+  for (const o of sharks)
+    if (o !== sh && !o.dead && o.faction !== sh.faction && dist(sh.x, sh.y, o.x, o.y) < 5.0)
+      damageShark(o, 45, sh.faction);
+  startInkStorm(sh.x, sh.y, sh.color);
+  spawnFloater(sh.x, sh.y - 1.8, "INK STORM!", sh.color);
   sfx("ulti");
+}
+function tryUlti() {
+  if (game.state !== "PLAYING" || player.dead || player.diving || player.special < 100) return;
+  // client: queue the ulti to send to the host (host runs the authoritative cast)
+  if (net.role === "client") { net.ultiPending = true; return; }
+  doUlti(player);
 }
 
 /* INK STORM — an animated swirling vortex with expanding shockwave rings, a
    spiralling ink cyclone and a glowing core, instead of a flat screen flash. */
 let inkStorm = null;
-function startInkStorm(x, y) {
-  inkStorm = { x, y, t: 0.85, max: 0.85 };
+function startInkStorm(x, y, color) {
+  color = color || PLAYER_COLOR;
+  inkStorm = { x, y, t: 0.85, max: 0.85, color };
   // initial outward burst + a rising ink geyser
   for (let i = 0; i < 46; i++) {
     const a = (i / 46) * TAU, sp = rand(3, 8.5);
-    spawnParticle(x, y, Math.cos(a) * sp, Math.sin(a) * sp, i % 4 === 0 ? "#eaffff" : PLAYER_COLOR, rand(0.5, 1.0), rand(2, 4), 0.3);
+    spawnParticle(x, y, Math.cos(a) * sp, Math.sin(a) * sp, i % 4 === 0 ? "#eaffff" : color, rand(0.5, 1.0), rand(2, 4), 0.3);
   }
   for (let i = 0; i < 14; i++)
-    spawnParticle(x + rand(-0.6, 0.6), y, rand(-1, 1), rand(-2, -0.6), PLAYER_COLOR, rand(0.6, 1.1), rand(2, 3.5), 0.45);
+    spawnParticle(x + rand(-0.6, 0.6), y, rand(-1, 1), rand(-2, -0.6), color, rand(0.6, 1.1), rand(2, 3.5), 0.45);
 }
 function updateInkStorm(dt) {
   if (!inkStorm) return;
@@ -1211,7 +1346,7 @@ function updateInkStorm(dt) {
     const px = inkStorm.x + Math.cos(a) * rad, py = inkStorm.y + Math.sin(a) * rad;
     const tx = -Math.sin(a), ty = Math.cos(a);     // tangential = swirl
     spawnParticle(px, py, tx * 3.4 + Math.cos(a) * 1.4, ty * 3.4 + Math.sin(a) * 1.4,
-      i === 0 ? "#eaffff" : PLAYER_COLOR, rand(0.3, 0.6), rand(1.5, 3), 0.2);
+      i === 0 ? "#eaffff" : inkStorm.color, rand(0.3, 0.6), rand(1.5, 3), 0.2);
   }
 }
 function drawInkStorm() {
@@ -1227,7 +1362,7 @@ function drawInkStorm() {
     if (rt <= 0 || rt >= 1) continue;
     const rad = rt * maxR;
     ctx.globalAlpha = (1 - rt) * 0.55 * alpha;
-    ctx.strokeStyle = (k % 2) ? "#eaffff" : PLAYER_COLOR;
+    ctx.strokeStyle = (k % 2) ? "#eaffff" : inkStorm.color;
     ctx.lineWidth = (3 - rt * 2) * UI;
     ctx.beginPath(); ctx.ellipse(s.x, s.y, rad, rad * 0.5, 0, 0, TAU); ctx.stroke();
   }
@@ -1249,9 +1384,9 @@ function updateEnemy(e, dt) {
   if (e.dead) {
     e.respawn -= dt;
     if (e.respawn <= 0) {
-      e.dead = false; e.hp = ENEMY_MAX_HP; e.ink = INK_MAX;
+      e.dead = false; e.hp = e.maxHp || ENEMY_MAX_HP; e.ink = INK_MAX;
       e.x = e.spawn[0]; e.y = e.spawn[1]; e.iframe = 1.0;
-      paintTiles(e.x, e.y, 2.0, OWN_ENEMY, e.color);
+      paintTiles(e.x, e.y, 2.0, e.faction, e.color);
       respawnFX(e, e.color);   // pop back in
     }
     return;
@@ -1264,8 +1399,8 @@ function updateEnemy(e, dt) {
   if (e.shield > 0) e.shield -= dt;
 
   const tHere = tileAt(Math.floor(e.x), Math.floor(e.y));
-  const ownerHere = tHere ? tHere.owner : OWN_NONE;
-  const onOwn = ownerHere === OWN_ENEMY;
+  const teamHere = tHere ? tHere.team : -1;
+  const onOwn = teamHere === e.faction;
 
   const dToPlayer = (player.dead) ? 999 : dist(e.x, e.y, player.x, player.y);
   // player diving reduces detection radius
@@ -1349,7 +1484,7 @@ function updateEnemy(e, dt) {
     const tmp = dx; dx = -dy; dy = tmp; // rotate 90°
   }
 
-  let spd = speedForTile(e, ownerHere, e.diving);
+  let spd = speedForTile(e, teamHere, e.diving);
   if (e.speedBoost > 0) spd *= 1.4;                 // SPEED power-up
   if (e.state === "RECHARGE" && onOwn) spd *= 0.4; // sit and recharge
   if (d > 0.25) {
@@ -1378,13 +1513,13 @@ function updateEnemy(e, dt) {
       e.ink -= SHOT_COST;
       e.squash = -0.4;
       const cx = Math.cos(ang), cy = Math.sin(ang);
-      spawnProjectile(e.x + cx*0.4, e.y + cy*0.4, cx, cy, OWN_ENEMY, e.color, e.dark, 9.5, 6, false);
+      spawnProjectile(e.x + cx*0.4, e.y + cy*0.4, cx, cy, e.faction, e.color, e.dark, 9.5, 6);
       addFlash(e.x + cx*0.45, e.y + cy*0.45, ang, e.color); // muzzle VFX
       if (dist(e.x, e.y, player.x, player.y) < 11) sfx("eshoot"); // only audible if near
     }
   }
 
-  rechargeInk(e, onOwn, ownerHere, dt);
+  rechargeInk(e, onOwn, teamHere, dt);
   e.squash = lerp(e.squash, 0, dt * 10);
 }
 
@@ -1439,29 +1574,32 @@ function updateProjectiles(dt) {
     // obstacle / wall
     const t = tileAt(Math.floor(p.x), Math.floor(p.y));
     if (!t || t.terrain === T_OBST) hit = true;
-    // entity hits
+    // entity hits — any shark of a different faction (no friendly fire)
     if (!hit) {
-      if (p.fromPlayer) {
-        for (const e of enemies) {
-          if (!e.dead && e.iframe <= 0 && dist2(p.x, p.y, e.x, e.y) < 0.32*0.32 + p.r*p.r) {
-            damageEnemy(e, p.directDmg); hit = true; break;
-          }
-        }
-      } else {
-        if (!player.dead && player.iframe <= 0 && dist2(p.x, p.y, player.x, player.y) < 0.34*0.34 + p.r*p.r) {
-          damagePlayer(p.directDmg, false); hit = true;
+      for (const sh of sharks) {
+        if (sh.faction === p.faction || sh.dead || sh.iframe > 0) continue;
+        const rr = (sh === player ? 0.34 : 0.32);
+        if (dist2(p.x, p.y, sh.x, sh.y) < rr * rr + p.r * p.r) {
+          damageShark(sh, p.directDmg, p.faction); hit = true; break;
         }
       }
     }
     if (hit) {
       p.alive = false;
-      onSplash(p.x, p.y, p.owner, p.color, p.dark, p.fromPlayer, p.splashR, p.splashDmg);
+      onSplash(p.x, p.y, p.faction, p.color, p.dark, p.splashR, p.splashDmg);
     }
   }
 }
 
-function damageEnemy(e, amount) {
+// route damage to the right per-shark handler
+function damageShark(sh, amount, byFaction) {
+  if (sh === player) damagePlayer(amount, false);
+  else damageEnemy(sh, amount, byFaction);
+}
+
+function damageEnemy(e, amount, byFaction) {
   if (e.dead) return;
+  if (byFaction == null) byFaction = 0;
   if (e.shield > 0) { spawnFloater(e.x, e.y - 1, "BLOCK", "#ffd23d"); return; }
   e.hp -= amount;
   e.iframe = 0.15;
@@ -1471,12 +1609,12 @@ function damageEnemy(e, amount) {
   sfx("hit");
   if (e.hp <= 0) {
     e.dead = true; e.respawn = RESPAWN_DELAY; e.diving = false;
-    player.score += 100; player.kills += 1;
-    player.special = Math.min(100, player.special + 22); // big SPECIAL gain on a splat
-    spawnFloater(e.x, e.y - 1.5, "SPLATTED!", PLAYER_COLOR);
+    const killer = sharks.find(s => s.faction === byFaction);
+    if (killer) { killer.score = (killer.score || 0) + 100; killer.kills = (killer.kills || 0) + 1; killer.special = Math.min(100, (killer.special || 0) + 22); }
+    const kc = FACTION_COLORS[byFaction] ? FACTION_COLORS[byFaction].ink : PLAYER_COLOR;
+    spawnFloater(e.x, e.y - 1.5, "SPLATTED!", kc);
     deathBurst(e.x, e.y, e.color);
-    // bonus paint where they died
-    paintTiles(e.x, e.y, 2.5, OWN_PLAYER, PLAYER_COLOR);
+    paintTiles(e.x, e.y, 2.5, byFaction, kc);   // bonus paint where they died
     sfx("splat");
   }
 }
@@ -1484,18 +1622,15 @@ function damageEnemy(e, amount) {
 /* ============================================================
    12. INK SPLASH / PAINTING
    ============================================================ */
-function onSplash(x, y, owner, color, dark, fromPlayer, splashR, splashDmg) {
+function onSplash(x, y, faction, color, dark, splashR, splashDmg) {
   splashR = splashR || SPLASH_RADIUS;
   splashDmg = splashDmg == null ? 12 : splashDmg;
-  paintTiles(x, y, splashR, owner, color);
-  // damage entities inside splash radius
+  paintTiles(x, y, splashR, faction, color);
+  // damage every rival-faction shark inside the splash radius
   let didHit = false;
-  if (fromPlayer) {
-    for (const e of enemies)
-      if (!e.dead && e.iframe <= 0 && dist(x, y, e.x, e.y) < splashR * 0.6) { damageEnemy(e, splashDmg); didHit = true; }
-  } else {
-    if (!player.dead && player.iframe <= 0 && dist(x, y, player.x, player.y) < splashR * 0.6)
-      { damagePlayer(splashDmg, false); didHit = true; }
+  for (const sh of sharks) {
+    if (sh.faction === faction || sh.dead || sh.iframe > 0) continue;
+    if (dist(x, y, sh.x, sh.y) < splashR * 0.6) { damageShark(sh, splashDmg, faction); didHit = true; }
   }
   const big = splashR >= 2.8;
   // ink splat decal + expanding ring on the floor (bigger/brighter on a hit)
@@ -1695,7 +1830,7 @@ function drawPickup(p) {
 }
 
 // Paint tiles within radius; closer = stronger; gradual overwrite of opposite ink.
-function paintTiles(cx, cy, radius, owner, color) {
+function paintTiles(cx, cy, radius, team, color) {
   const minX = Math.max(0, Math.floor(cx - radius));
   const maxX = Math.min(MAP_W - 1, Math.ceil(cx + radius));
   const minY = Math.max(0, Math.floor(cy - radius));
@@ -1708,35 +1843,30 @@ function paintTiles(cx, cy, radius, owner, color) {
       if (d > radius) continue;
       const strength = (1 - d / radius);          // 0..1
       const add = 0.35 + strength * 0.9;          // coverage added
-      if (t.owner === owner) {
+      if (t.team === team) {
         t.ink = clamp(t.ink + add, 0, 1);
-      } else if (t.owner === OWN_NONE) {
-        t.owner = owner; t.ink = clamp(add, 0, 1); t.inkColor = color;
+      } else if (t.team === -1) {
+        t.team = team; t.ink = clamp(add, 0, 1); t.inkColor = color;
       } else {
         // overwrite opposing ink gradually
         t.ink -= add;
-        if (t.ink <= 0) { t.owner = owner; t.ink = clamp(-t.ink, 0.05, 1); t.inkColor = color; }
+        if (t.ink <= 0) { t.team = team; t.ink = clamp(-t.ink, 0.05, 1); t.inkColor = color; }
       }
-      if (t.owner === owner) t.inkColor = color;
-      t.pulse = 1; // tile pulse animation
+      if (t.team === team) t.inkColor = color;
+      t.pulse = 1;       // tile pulse animation
+      if (netDirty) netDirty.add(ty * MAP_W + tx);   // (MP) mark for delta sync
     }
   }
 }
 
-// (GANG_BY_INK is maintained by applyPalette so it tracks the active palette)
-
-// Count coverage for the player and each of the 3 rival gangs separately
+// Count tiles covered by each of the 4 factions
 function tallyTerritory() {
-  let p = 0; const g = [0, 0, 0];
+  const f = [0, 0, 0, 0];
   for (const t of map) {
     if (t.terrain === T_OBST) continue;
-    if (t.owner === OWN_PLAYER) p++;
-    else if (t.owner === OWN_ENEMY) {
-      const gi = GANG_BY_INK[t.inkColor];
-      g[(gi == null ? 0 : gi)]++;
-    }
+    if (t.team >= 0) f[t.team]++;
   }
-  return { p, g };
+  return f;
 }
 
 // Recompute territory percentages (throttled)
@@ -1745,11 +1875,9 @@ function updateTerritory(dt) {
   pctTimer -= dt;
   if (pctTimer > 0) return;
   pctTimer = 0.4; // update a few times per second (cheap)
-  const { p, g } = tallyTerritory();
+  const f = tallyTerritory();
   const tot = paintableTotal || 1;
-  game.pct.player = p / tot * 100;
-  game.pct.gangs = [g[0] / tot * 100, g[1] / tot * 100, g[2] / tot * 100];
-  game.pct.enemy = (g[0] + g[1] + g[2]) / tot * 100;
+  game.pct.factions = [f[0] / tot * 100, f[1] / tot * 100, f[2] / tot * 100, f[3] / tot * 100];
 }
 
 /* ============================================================
@@ -1801,7 +1929,19 @@ function project(wx, wy) {
 /* ============================================================
    17. UPDATE LOOP (logic)
    ============================================================ */
+function hostSnap(dt) {
+  if (net.role !== "host") return;
+  net.snapAccum += dt;
+  if (net.snapAccum >= 1 / SNAP_HZ) { net.snapAccum = 0; netBroadcast(buildSnapshot()); }
+}
+
 function update(dt) {
+  // CLIENT: never run the sim — interpolate snapshots + send input only
+  if (net.role === "client") {
+    if (game.state === "PLAYING") netClientTick(dt);
+    return;
+  }
+
   if (game.state !== "PLAYING") return;
 
   // intro "3 · 2 · 1 · GO!" — freeze the action (and the match clock) until GO
@@ -1810,7 +1950,7 @@ function update(dt) {
     game.countdown -= dt;
     const nowCeil = Math.ceil(Math.max(0, game.countdown));
     if (nowCeil !== prevCeil) sfx(nowCeil > 0 ? "count" : "go");
-    if (game.countdown > 0) { updateCamera(dt); return; }   // stay frozen on 3/2/1
+    if (game.countdown > 0) { updateCamera(dt); hostSnap(dt); return; }   // stay frozen on 3/2/1
     // at GO the match begins; "GO!" keeps flashing for a beat while we play on
   }
 
@@ -1819,7 +1959,11 @@ function update(dt) {
   if (game.time <= 0) { game.time = 0; endMatch(); return; }
 
   updatePlayer(dt);
-  for (const e of enemies) updateEnemy(e, dt);
+  for (const e of enemies) {
+    // host: human-controlled factions are driven by their net input, not the AI
+    if (net.role === "host" && !e.isBot) driveHumanShark(e, dt);
+    else updateEnemy(e, dt);
+  }
   resolveSeparation();
   updateProjectiles(dt);
   updateParticles(dt);
@@ -1833,24 +1977,320 @@ function update(dt) {
 
   // decay tile pulses
   for (const t of map) if (t.pulse > 0) t.pulse = Math.max(0, t.pulse - dt * 3);
+
+  hostSnap(dt);   // stream authoritative state to clients
 }
 
 function endMatch() {
-  const { p, g } = tallyTerritory();
+  const f = tallyTerritory();
   const tot = paintableTotal || 1;
-  game.pct.player = p / tot * 100;
-  game.pct.gangs = [g[0] / tot * 100, g[1] / tot * 100, g[2] / tot * 100];
-  game.pct.enemy = (g[0] + g[1] + g[2]) / tot * 100;
+  game.pct.factions = f.map(c => c / tot * 100);
   // four-way turf war: you win by holding the MOST reef of all four factions
-  const maxGang = Math.max(g[0], g[1], g[2]);
-  const win = p >= maxGang && p > 0;
+  const mine = f[localFaction], best = Math.max(...f);
+  const win = mine >= best && mine > 0;
   game.result = {
-    win, pCount: p, gangs: g.slice(), maxGang,
-    coverScore: Math.round(game.pct.player * 10),
+    win, counts: f.slice(),
+    coverScore: Math.round(game.pct.factions[localFaction] * 10),
     killScore: player.kills * 100,
-    total: Math.round(game.pct.player * 10) + player.kills * 100,
+    total: Math.round(game.pct.factions[localFaction] * 10) + player.kills * 100,
   };
   game.state = win ? "VICTORY" : "GAMEOVER";
+  if (net.role === "host") netBroadcast({ t: "end", counts: f });
+}
+
+/* ============================================================
+   17b. NETWORK  (PeerJS, host-authoritative free-for-all)
+   ----------------------------------------------------------
+   Handshake via the free PeerJS cloud broker; gameplay is peer-to-peer.
+   Host simulates everything and streams snapshots; clients send input and
+   render the authoritative state. Works from static hosting (GitHub Pages).
+   ============================================================ */
+const NET_ID_PREFIX = "reefrumble-";      // namespace on the shared public broker
+const SNAP_HZ = 18, INPUT_HZ = 30;
+let netProj = [];                          // (client) projectiles from last snapshot
+let netReady = false;                      // PeerJS library present?
+
+function netAvailable() { return typeof Peer !== "undefined"; }
+
+function genCode() {
+  const A = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";   // no easily-confused chars
+  let s = "";
+  for (let i = 0; i < 5; i++) s += A[Math.floor(Math.random() * A.length)];
+  return s;
+}
+
+function netReset() {
+  try { if (net.peer) net.peer.destroy(); } catch (e) {}
+  net.role = null; net.peer = null; net.conns = []; net.hostConn = null;
+  net.roomCode = null; net.mode = null; net.players = []; net.factionConn = {};
+  net.ultiPending = false; net.snapAccum = 0; net.inputAccum = 0;
+  net.lastSnap = null; net.started = false;
+  netProj = []; netDirty = null;
+}
+
+function netBroadcast(msg) {
+  for (const c of net.conns) { try { if (c.open) c.send(msg); } catch (e) {} }
+}
+
+function rosterMsg() {
+  return { t: "lobby", roster: net.players.map(p => ({ faction: p.faction, name: p.name, ready: p.ready })) };
+}
+
+// ---------- HOST ----------
+function netHost() {
+  if (!netAvailable()) { net.status = "PeerJS not loaded"; return; }
+  netReset();
+  net.role = "host"; net.mode = "host"; net.status = "Creating room…";
+  net.roomCode = genCode();
+  net.players = [{ faction: 0, name: "You (Host)", ready: true, isLocal: true, weaponIdx: weaponSel }];
+  net.peer = new Peer(NET_ID_PREFIX + net.roomCode);
+  net.peer.on("open", () => { net.status = "Room ready — share the code"; });
+  net.peer.on("error", (e) => {
+    // code clash on the broker → just try another
+    if (e && e.type === "unavailable-id") { net.roomCode = genCode(); try { net.peer.destroy(); } catch (x) {} netHost(); return; }
+    net.status = "Network error: " + (e && e.type ? e.type : "unknown");
+  });
+  net.peer.on("connection", (conn) => {
+    conn.on("open", () => hostOnConnect(conn));
+    conn.on("data", (d) => hostOnData(conn, d));
+    conn.on("close", () => hostOnClose(conn));
+    conn.on("error", () => hostOnClose(conn));
+  });
+}
+
+function freeFaction() {
+  for (let f = 1; f <= 3; f++) if (!net.factionConn[f]) return f;
+  return -1;
+}
+
+function hostOnConnect(conn) {
+  if (net.started) { try { conn.send({ t: "full_reject", reason: "in progress" }); conn.close(); } catch (e) {} return; }
+  const f = freeFaction();
+  if (f < 0) { try { conn.send({ t: "full_reject", reason: "room full" }); conn.close(); } catch (e) {} return; }
+  conn._faction = f; net.factionConn[f] = conn; net.conns.push(conn);
+  net.players.push({ faction: f, name: "Player " + f, ready: false, conn });
+  conn.send({ t: "assign", faction: f, code: net.roomCode, stage: currentLayout });
+  netBroadcast(rosterMsg());
+}
+
+function hostOnData(conn, msg) {
+  if (!msg || !msg.t) return;
+  const f = conn._faction;
+  if (msg.t === "join") {
+    const p = net.players.find(x => x.faction === f);
+    if (p) { if (msg.name) p.name = msg.name; if (msg.weaponIdx != null) p.weaponIdx = msg.weaponIdx; }
+    netBroadcast(rosterMsg());
+  } else if (msg.t === "ready") {
+    const p = net.players.find(x => x.faction === f);
+    if (p) p.ready = !!msg.ready;
+    netBroadcast(rosterMsg());
+  } else if (msg.t === "input" && net.started) {
+    const sh = sharks[f];
+    if (sh) sh.netInput = msg.in;
+  }
+}
+
+function hostOnClose(conn) {
+  const f = conn._faction;
+  net.conns = net.conns.filter(c => c !== conn);
+  if (f != null) {
+    delete net.factionConn[f];
+    net.players = net.players.filter(p => p.faction !== f);
+    // mid-match: that faction reverts to a bot
+    if (net.started && sharks[f]) { sharks[f].isBot = true; sharks[f].netInput = null; }
+    netBroadcast(rosterMsg());
+  }
+}
+
+function netStartHost() {
+  if (net.role !== "host") return;
+  const humans = [0, ...Object.keys(net.factionConn).map(Number)];
+  const weapons = {};
+  for (const p of net.players) weapons[p.faction] = p.weaponIdx || 0;
+  netDirty = new Set();
+  net.started = true;
+  netBroadcast({ t: "start", stage: currentLayout, humans, weapons });
+  startMatch({ localFaction: 0, humans, weapons, stage: currentLayout, netRole: "host" });
+  netDirty.clear();   // starting puddles are deterministic on every client
+}
+
+// ---------- CLIENT ----------
+function netJoin(code) {
+  if (!netAvailable()) { net.status = "PeerJS not loaded"; return; }
+  netReset();
+  net.role = "client"; net.mode = "join"; net.status = "Connecting…";
+  net.roomCode = code;
+  net.peer = new Peer();
+  net.peer.on("open", () => {
+    const conn = net.peer.connect(NET_ID_PREFIX + code, { reliable: true });
+    net.hostConn = conn;
+    conn.on("open", () => {
+      net.status = "Connected — waiting in lobby";
+      conn.send({ t: "join", name: "Player", weaponIdx: weaponSel });
+    });
+    conn.on("data", (d) => clientOnData(d));
+    conn.on("close", () => clientLostHost());
+    conn.on("error", () => clientLostHost());
+  });
+  net.peer.on("error", (e) => {
+    const ty = e && e.type ? e.type : "unknown";
+    net.status = (ty === "peer-unavailable") ? "Room not found — check the code" : "Network error: " + ty;
+  });
+}
+
+function clientOnData(msg) {
+  if (!msg || !msg.t) return;
+  if (msg.t === "assign") {
+    localFaction = msg.faction; net.roomCode = msg.code;
+    if (msg.stage != null) currentLayout = msg.stage;
+    net.status = "In lobby — faction " + msg.faction;
+  } else if (msg.t === "lobby") {
+    net.players = msg.roster.map(p => ({ ...p, isLocal: p.faction === localFaction }));
+  } else if (msg.t === "start") {
+    if (msg.stage != null) currentLayout = msg.stage;
+    net.started = true;
+    startMatch({ localFaction, humans: msg.humans, weapons: msg.weapons, stage: msg.stage, netRole: "client" });
+  } else if (msg.t === "snap") {
+    net.lastSnap = msg;
+  } else if (msg.t === "end") {
+    clientEndMatch(msg.counts);
+  } else if (msg.t === "full_reject") {
+    clientLostHost(msg.reason === "room full" ? "Room is full" : "Match already started");
+  }
+}
+
+function clientLostHost(reason) {
+  if (net.role !== "client") return;
+  netReset();
+  net.status = reason || "Host disconnected";
+  game.state = "TITLE";
+}
+
+function clientEndMatch(counts) {
+  const tot = paintableTotal || 1;
+  const f = counts || tallyTerritory();
+  game.pct.factions = f.map(c => c / tot * 100);
+  const mine = f[localFaction], best = Math.max(...f);
+  const win = mine >= best && mine > 0;
+  game.result = {
+    win, counts: f.slice(),
+    coverScore: Math.round(game.pct.factions[localFaction] * 10),
+    killScore: (player.kills || 0) * 100,
+    total: Math.round(game.pct.factions[localFaction] * 10) + (player.kills || 0) * 100,
+  };
+  game.state = win ? "VICTORY" : "GAMEOVER";
+}
+
+// ---------- SNAPSHOT (host build / client apply) ----------
+function buildSnapshot() {
+  const s = sharks.map(sh => ({
+    f: sh.faction,
+    x: +sh.x.toFixed(2), y: +sh.y.toFixed(2), a: +sh.aim.toFixed(2),
+    hp: Math.round(sh.hp), ink: Math.round(sh.ink), sp: Math.round(sh.special),
+    dv: sh.diving ? 1 : 0, dd: sh.dead ? 1 : 0, fc: sh.facing,
+    wi: sh.weaponIdx || 0, sb: sh.speedBoost > 0 ? 1 : 0, sd: sh.shield > 0 ? 1 : 0,
+    uf: +(sh.ultiFlash || 0).toFixed(2),
+  }));
+  const pr = [];
+  for (const p of projectiles) if (p.alive) pr.push({ x: +p.x.toFixed(2), y: +p.y.toFixed(2), f: p.faction, r: +(p.r || 0.28).toFixed(2) });
+  const pk = [];
+  for (const p of pickups) if (p.active) pk.push({ x: +p.x.toFixed(2), y: +p.y.toFixed(2), ty: p.type });
+  const tiles = [];
+  if (netDirty) { for (const i of netDirty) { const t = map[i]; if (t) tiles.push([i, t.team, +t.ink.toFixed(2)]); } netDirty.clear(); }
+  return {
+    t: "snap", s, pr, pk, tiles,
+    pct: game.pct.factions.map(v => +v.toFixed(1)),
+    time: +game.time.toFixed(1), cd: +game.countdown.toFixed(2), st: game.state,
+  };
+}
+
+function netApply(snap) {
+  if (!snap) return;
+  for (const sd of snap.s) {
+    const sh = sharks[sd.f]; if (!sh) continue;
+    sh.netX = sd.x; sh.netY = sd.y;
+    sh.hp = sd.hp; sh.ink = sd.ink; sh.special = sd.sp;
+    sh.diving = !!sd.dv; sh.dead = !!sd.dd;
+    sh.speedBoost = sd.sb ? 1 : 0; sh.shield = sd.sd ? 1 : 0;
+    sh.weaponIdx = sd.wi; sh.weapon = WEAPONS[sd.wi] || WEAPONS[0];
+    if (sd.uf > 0) sh.ultiFlash = sd.uf;
+    if (sh !== player) { sh.netAim = sd.a; sh.facing = sd.fc; }   // keep local aim responsive
+  }
+  if (snap.tiles) for (const tup of snap.tiles) {
+    const t = map[tup[0]]; if (!t) continue;
+    t.team = tup[1]; t.ink = tup[2];
+    t.inkColor = t.team >= 0 ? FACTION_COLORS[t.team].ink : null;
+    t.pulse = 1;
+  }
+  netProj = snap.pr || [];
+  // rebuild client pickup list for rendering
+  pickups.length = 0;
+  for (const p of (snap.pk || [])) pickups.push({ x: p.x, y: p.y, type: p.ty, active: true, life: 10, bob: 0 });
+  if (snap.pct) game.pct.factions = snap.pct;
+  if (typeof snap.time === "number") game.time = snap.time;
+  if (typeof snap.cd === "number") game.countdown = snap.cd;
+  if (snap.st && snap.st !== game.state && (snap.st === "PLAYING" || snap.st === "PAUSED")) game.state = snap.st;
+}
+
+// Build this client's serialized input (aim resolved here from local controls).
+function gatherNetInput() {
+  let ix = 0, iy = 0;
+  if (keys["w"] || keys["arrowup"]) iy -= 1;
+  if (keys["s"] || keys["arrowdown"]) iy += 1;
+  if (keys["a"] || keys["arrowleft"]) ix -= 1;
+  if (keys["d"] || keys["arrowright"]) ix += 1;
+  if (moveStick.active) { ix += moveStick.dx; iy += moveStick.dy; }
+  let aim = player.aim;
+  if (isTouch && !usingMouse) {
+    let aimed = false;
+    const dragMag = Math.abs(btnShoot.dx) + Math.abs(btnShoot.dy);
+    if (btnShoot.pressed && dragMag > 0.3) { const w = screenToWorld(btnShoot.dx, btnShoot.dy); aim = Math.atan2(w.y, w.x); aimed = true; }
+    else if (btnShoot.pressed) {
+      let best = null, bd = 8;
+      for (const e of enemies) { if (e.dead) continue; const d = dist(player.x, player.y, e.x, e.y); if (d < bd) { bd = d; best = e; } }
+      if (best) { aim = Math.atan2(best.y - player.y, best.x - player.x); aimed = true; }
+    }
+    if (!aimed) { const wx = (ix + iy), wy = (iy - ix); if (Math.hypot(wx, wy) > 0.001) aim = Math.atan2(wy, wx); }
+  } else {
+    const sc = worldToScreen(player.x, player.y);
+    const psx = sc.x - camera.x + VIEW_W / 2;
+    const psy = sc.y - camera.y + VIEW_H / 2 - 14;
+    const w = screenToWorld(mouseScreenX - psx, mouseScreenY - psy);
+    if (Math.abs(w.x) + Math.abs(w.y) > 0.0001) aim = Math.atan2(w.y, w.x);
+  }
+  player.aim = aim;   // local responsiveness for reticle/blaster
+  const fire = (mouseDown || keys[" "] || btnShoot.pressed) ? 1 : 0;
+  const dive = (keys["shift"] || btnDive.pressed) ? 1 : 0;
+  const ulti = net.ultiPending ? 1 : 0; net.ultiPending = false;
+  return { ix: +ix.toFixed(2), iy: +iy.toFixed(2), aim: +aim.toFixed(3), fire, dive, ulti };
+}
+
+// (client) smooth toward the latest authoritative shark transforms + run VFX only
+function netClientTick(dt) {
+  if (net.lastSnap) { netApply(net.lastSnap); net.lastSnap = null; }
+  // interpolate shark positions toward their net targets
+  const k = Math.min(1, dt * 14);
+  for (const sh of sharks) {
+    if (sh.netX != null) { sh.x += (sh.netX - sh.x) * k; sh.y += (sh.netY - sh.y) * k; }
+    if (sh !== player && sh.netAim != null) sh.aim = sh.netAim;
+    if (sh.ultiFlash > 0) sh.ultiFlash -= dt;
+    if (sh.popIn > 0) sh.popIn -= dt;
+    sh.squash = lerp(sh.squash || 0, 0, dt * 10);
+    if (Math.abs(sh.netX - sh.x) + Math.abs(sh.netY - sh.y) > 0.02) sh.walkPhase += dt * 8;
+  }
+  // local-only visual effects (host owns the sim)
+  updateParticles(dt); updateImpacts(dt); updateFlashes(dt); updateAuras(dt); updateInkStorm(dt);
+  for (const p of pickups) p.bob += dt * 3;
+  updateCamera(dt);
+  for (const t of map) if (t.pulse > 0) t.pulse = Math.max(0, t.pulse - dt * 3);
+  // send input to host
+  net.inputAccum += dt;
+  if (net.inputAccum >= 1 / INPUT_HZ) {
+    net.inputAccum = 0;
+    if (net.hostConn && net.hostConn.open && game.state === "PLAYING") {
+      try { net.hostConn.send({ t: "input", in: gatherNetInput() }); } catch (e) {}
+    }
+  }
 }
 
 /* ============================================================
@@ -1891,6 +2331,7 @@ function renderScene() {
   if (game.state === "SETTINGS") { drawSettings(); return; }
   if (game.state === "HOWTO") { drawHowTo(); return; }
   if (game.state === "CREDITS") { drawCredits(); return; }
+  if (game.state === "LOBBY") { drawLobby(); return; }
 
   drawArena();
 
@@ -1971,10 +2412,13 @@ function drawWaterBackground() {
   ctx.globalAlpha = 1;
 
   // 5) ink reflection glow + foam rim around the stage (only during play)
-  if (game.state !== "TITLE") {
+  if (game.state !== "TITLE" && game.state !== "LOBBY") {
     const ctr = project(MAP_W / 2 - 0.5, MAP_H / 2 - 0.5);
-    waterGlow(ctr.x - 50, ctr.y + 24, 260, "25,230,255", 0.45 + game.pct.player / 130);
-    waterGlow(ctr.x + 50, ctr.y + 24, 260, "255,61,240", 0.45 + game.pct.enemy / 130);
+    const fp = game.pct.factions || [0, 0, 0, 0];
+    const myPct = fp[localFaction] || 0;
+    const rivalPct = fp.reduce((s, v, i) => s + (i === localFaction ? 0 : v), 0);
+    waterGlow(ctr.x - 50, ctr.y + 24, 260, "25,230,255", 0.45 + myPct / 130);
+    waterGlow(ctr.x + 50, ctr.y + 24, 260, "255,61,240", 0.45 + rivalPct / 130);
     drawStageFoam(t, ctr);
   }
 }
@@ -2053,7 +2497,7 @@ function drawReticle() {
   const r = project(imp.x, imp.y);
   const pulse = 0.6 + 0.4 * Math.sin(bgT * 10);
   const lowInk = player.ink < SHOT_COST;
-  const col = lowInk ? "#ff6b6b" : PLAYER_COLOR;
+  const col = lowInk ? "#ff6b6b" : player.color;
   ctx.globalAlpha = 0.85 * pulse;
   ctx.strokeStyle = col; ctx.lineWidth = 2;
   // iso-flattened ring on the floor
@@ -2096,6 +2540,11 @@ function drawArena() {
     drawList.push({ depth: e.x + e.y + 0.5, type: "enemy", e });
   if (!player.dead) drawList.push({ depth: player.x + player.y + 0.5, type: "player" });
   for (const p of projectiles) if (p.alive) drawList.push({ depth: p.x + p.y + 0.4, type: "proj", p });
+  // client: projectiles come from the host's snapshot (render-only blobs)
+  if (net.role === "client") for (const p of netProj) {
+    const fc = FACTION_COLORS[p.f] || FACTION_COLORS[0];
+    drawList.push({ depth: p.x + p.y + 0.4, type: "proj", p: { x: p.x, y: p.y, color: fc.ink, travelled: 0, range: 1 } });
+  }
   for (const p of pickups) if (p.active) drawList.push({ depth: p.x + p.y + 0.3, type: "pickup", p });
 
   drawList.sort((a, b) => a.depth - b.depth);
@@ -2128,8 +2577,8 @@ function drawTile(t) {
 
   // ink overlay color blend
   let inked = false, inkC = null;
-  if (t.owner !== OWN_NONE && t.ink > 0) {
-    inkC = t.inkColor || (t.owner === OWN_PLAYER ? PLAYER_COLOR : ENEMY_COLORS[0].ink);
+  if (t.team >= 0 && t.ink > 0) {
+    inkC = t.inkColor || FACTION_COLORS[t.team].ink;
     const pulseAmt = t.pulse * 0.4;
     top = shade(inkC, -0.12 + t.ink * 0.18 + pulseAmt);
     inked = true;
@@ -2272,9 +2721,8 @@ function poly(cx, cy, pts) {
 function drawShark(ent, isPlayer) {
   const p = project(ent.x, ent.y);
   let px = Math.round(p.x), py = Math.round(p.y);
-  const col = isPlayer ? PLAYER_BODY : ent.body;
-  const dark = isPlayer ? PLAYER_BODY_DARK : ent.dark;
-  const ink  = isPlayer ? PLAYER_COLOR : ent.color;
+  const col = ent.body, dark = ent.dark, ink = ent.color;   // each shark = its faction colors
+  const isSelf = (ent.faction === localFaction);            // "you" = the local faction
 
   // i-frame blink
   if (ent.iframe > 0 && Math.floor(ent.iframe * 14) % 2 === 0) return;
@@ -2324,22 +2772,22 @@ function drawShark(ent, isPlayer) {
   ctx.save();
   ctx.translate(px, py + 3 + bob);
   ctx.scale(face * sq, st);
-  drawChibiBody(col, dark, ink, isPlayer, ent.walkPhase, moving);
+  drawChibiBody(col, dark, ink, isSelf, ent.walkPhase, moving);
   ctx.restore();
 
   // shell-and-coral sea-ink blaster, held low in the front hand, aimed in world space
-  drawBlaster(px, py - 9 + bob, ent.aim, ink, dark, isPlayer ? (player.weaponIdx || 0) : 0);
+  drawBlaster(px, py - 9 + bob, ent.aim, ink, dark, ent.weaponIdx || 0);
 
   // floating identity tag above the head
   const ty = py - 48 + Math.sin(bgT * 4 + ent.x * 1.7) * 1.2;
-  if (isPlayer) {
-    // cyan "YOU" with a downward pointer
+  if (isSelf) {
+    // "YOU" in your faction colour with a downward pointer
     ctx.textAlign = "center";
     ctx.font = "bold 8px monospace";
     ctx.fillStyle = "#06202b"; ctx.fillText("YOU", px + 1, ty + 1);
-    ctx.fillStyle = PLAYER_COLOR; ctx.fillText("YOU", px, ty);
+    ctx.fillStyle = ink; ctx.fillText("YOU", px, ty);
     ctx.fillStyle = "#06202b"; poly(px, ty + 8, [[-5, -4], [5, -4], [0, 4]]);
-    ctx.fillStyle = PLAYER_COLOR; poly(px, ty + 7, [[-4, -4], [4, -4], [0, 3]]);
+    ctx.fillStyle = ink; poly(px, ty + 7, [[-4, -4], [4, -4], [0, 3]]);
     ctx.textAlign = "left";
   } else {
     // numbered gang badge in the rival's ink colour
@@ -2572,17 +3020,18 @@ function barText(cx, cy, txt) {
 }
 // round shark portrait for the status panel
 function drawSharkPortrait(cx, cy, r) {
+  const pBody = player.body || PLAYER_BODY, pDark = player.dark || PLAYER_BODY_DARK, pInk = player.color || PLAYER_COLOR;
   ctx.fillStyle = "#0c2c3a"; ctx.beginPath(); ctx.arc(cx, cy, r + 2, 0, TAU); ctx.fill();
-  ctx.fillStyle = PLAYER_BODY; ctx.beginPath(); ctx.arc(cx, cy, r, 0, TAU); ctx.fill();
-  ctx.fillStyle = shade(PLAYER_BODY, 0.28); ctx.beginPath(); ctx.ellipse(cx, cy + r * 0.42, r * 0.7, r * 0.45, 0, 0, Math.PI); ctx.fill();
-  ctx.fillStyle = PLAYER_BODY_DARK; poly(cx - 1, cy - r * 0.78, [[0, 3], [-4, -6], [6, -1]]); // fin
+  ctx.fillStyle = pBody; ctx.beginPath(); ctx.arc(cx, cy, r, 0, TAU); ctx.fill();
+  ctx.fillStyle = shade(pBody, 0.28); ctx.beginPath(); ctx.ellipse(cx, cy + r * 0.42, r * 0.7, r * 0.45, 0, 0, Math.PI); ctx.fill();
+  ctx.fillStyle = pDark; poly(cx - 1, cy - r * 0.78, [[0, 3], [-4, -6], [6, -1]]); // fin
   ctx.fillStyle = "#0e2c36"; rrect(cx - r * 0.92, cy - r * 0.28, r * 1.84, r * 0.3); // goggle strap
   const ex = r * 0.42, ey = cy - r * 0.06, er = r * 0.3;
   ctx.fillStyle = "#fff";
   ctx.beginPath(); ctx.arc(cx - ex, ey, er, 0, TAU); ctx.fill(); ctx.beginPath(); ctx.arc(cx + ex, ey, er, 0, TAU); ctx.fill();
   ctx.fillStyle = "#06202b";
   ctx.beginPath(); ctx.arc(cx - ex + 1, ey, er * 0.5, 0, TAU); ctx.fill(); ctx.beginPath(); ctx.arc(cx + ex + 1, ey, er * 0.5, 0, TAU); ctx.fill();
-  ctx.strokeStyle = PLAYER_COLOR; ctx.lineWidth = Math.max(1, UI);
+  ctx.strokeStyle = pInk; ctx.lineWidth = Math.max(1, UI);
   ctx.beginPath(); ctx.arc(cx - ex, ey, er + 1, 0, TAU); ctx.stroke(); ctx.beginPath(); ctx.arc(cx + ex, ey, er + 1, 0, TAU); ctx.stroke();
   ctx.fillStyle = "#fff"; for (let i = 0; i < 3; i++) ctx.fillRect(cx - r * 0.32 + i * r * 0.26, cy + r * 0.52, r * 0.13, r * 0.2); // teeth
   // HP-tinted rim
@@ -2626,7 +3075,7 @@ function drawHUD() {
   let yy = pad + 7 * UI;
   segBar(bx, yy, bw, bh, player.hp / PLAYER_MAX_HP, player.hp > 40 ? "#37e07a" : "#ff5b5b");
   barText(bx + bw / 2, yy + bh / 2, Math.round(player.hp) + " / " + PLAYER_MAX_HP); yy += bh + 4 * UI;
-  segBar(bx, yy, bw, bh, player.ink / INK_MAX, player.ink < SHOT_COST ? "#4b6b78" : PLAYER_COLOR);
+  segBar(bx, yy, bw, bh, player.ink / INK_MAX, player.ink < SHOT_COST ? "#4b6b78" : player.color);
   barText(bx + bw / 2, yy + bh / 2, "INK  " + Math.round(player.ink)); yy += bh + 4 * UI;
   const ready = player.special >= 100;
   ctx.globalAlpha = ready ? (0.6 + 0.4 * Math.sin(bgT * 8)) : 1;
@@ -2638,7 +3087,7 @@ function drawHUD() {
   drawAbilityIcon(icx, iconY, iconR, "special", "#ffd23d", ready); icx += 23 * UI;
   drawAbilityIcon(icx, iconY, iconR, "speed", "#7cff4d", player.speedBoost > 0); icx += 23 * UI;
   drawAbilityIcon(icx, iconY, iconR, "shield", "#ffd23d", player.shield > 0); icx += 23 * UI;
-  drawAbilityIcon(icx, iconY, iconR, "ink", PLAYER_COLOR, player.ink >= INK_MAX - 1); icx += 20 * UI;
+  drawAbilityIcon(icx, iconY, iconR, "ink", player.color, player.ink >= INK_MAX - 1); icx += 20 * UI;
   if (ready) {
     ctx.globalAlpha = 0.6 + 0.4 * Math.sin(bgT * 8);
     ctx.fillStyle = "#ffd23d"; ctx.font = hudFont(9); ctx.textAlign = "left"; ctx.textBaseline = "middle";
@@ -2661,8 +3110,9 @@ function drawHUD() {
   // segmented bar split between you + the three rival gangs
   const trX = tx + 10 * UI, trY = ty + 24 * UI, trW = tw - 20 * UI, trH = 9 * UI;
   ctx.fillStyle = "#06202e"; ctx.fillRect(Math.round(trX), Math.round(trY), Math.round(trW), Math.round(trH));
-  const facs = [[game.pct.player, PLAYER_COLOR]];
-  for (let i = 0; i < 3; i++) facs.push([(game.pct.gangs && game.pct.gangs[i]) || 0, ENEMY_COLORS[i].ink]);
+  const fp = game.pct.factions || [0, 0, 0, 0];
+  const facs = [[fp[localFaction] || 0, FACTION_COLORS[localFaction].ink]];   // you first
+  for (let i = 0; i < 4; i++) if (i !== localFaction) facs.push([fp[i] || 0, FACTION_COLORS[i].ink]);
   let xo = trX;
   for (const f of facs) {
     const w = trW * f[0] / 100;
@@ -2681,15 +3131,17 @@ function drawHUD() {
   }
   ctx.textAlign = "left";
 
-  // ===== pause button (top-right) — clean two-bar pause glyph =====
-  const pb = pauseBtn();
-  ctx.fillStyle = "rgba(7,22,36,0.9)"; ctx.beginPath(); ctx.arc(pb.x, pb.y, pb.r + 2 * UI, 0, TAU); ctx.fill();
-  ctx.strokeStyle = "rgba(60,196,228,0.8)"; ctx.lineWidth = Math.max(1.5, 1.6 * UI);
-  ctx.beginPath(); ctx.arc(pb.x, pb.y, pb.r + 2 * UI, 0, TAU); ctx.stroke();
-  ctx.fillStyle = "#bfe9ff";
-  const pbarW = Math.max(2, pb.r * 0.32), pbarH = pb.r * 1.05, pbarG = pb.r * 0.34;
-  rrect(pb.x - pbarG - pbarW, pb.y - pbarH / 2, pbarW, pbarH);
-  rrect(pb.x + pbarG, pb.y - pbarH / 2, pbarW, pbarH);
+  // ===== pause button (top-right) — clean two-bar pause glyph (solo only) =====
+  if (!net.role) {
+    const pb = pauseBtn();
+    ctx.fillStyle = "rgba(7,22,36,0.9)"; ctx.beginPath(); ctx.arc(pb.x, pb.y, pb.r + 2 * UI, 0, TAU); ctx.fill();
+    ctx.strokeStyle = "rgba(60,196,228,0.8)"; ctx.lineWidth = Math.max(1.5, 1.6 * UI);
+    ctx.beginPath(); ctx.arc(pb.x, pb.y, pb.r + 2 * UI, 0, TAU); ctx.stroke();
+    ctx.fillStyle = "#bfe9ff";
+    const pbarW = Math.max(2, pb.r * 0.32), pbarH = pb.r * 1.05, pbarG = pb.r * 0.34;
+    rrect(pb.x - pbarG - pbarW, pb.y - pbarH / 2, pbarW, pbarH);
+    rrect(pb.x + pbarG, pb.y - pbarH / 2, pbarW, pbarH);
+  }
 
   // ===== dead overlay (fades in so the death VFX is visible first) =====
   if (player.dead) {
@@ -2717,8 +3169,7 @@ function drawMinimap() {
       const t = map[y * MAP_W + x];
       let c;
       if (t.terrain === T_OBST) c = "#0a1f2e";
-      else if (t.owner === OWN_PLAYER) c = PLAYER_COLOR;
-      else if (t.owner === OWN_ENEMY) c = t.inkColor || ENEMY_COLORS[0].ink;
+      else if (t.team >= 0) c = t.inkColor || FACTION_COLORS[t.team].ink;
       else c = "#16384b";
       ctx.fillStyle = c;
       ctx.fillRect(Math.floor(mx + x * box), Math.floor(my + y * box), Math.ceil(box), Math.ceil(box));
@@ -2758,7 +3209,7 @@ function drawMobileControls() {
 }
 // FIRE pad: a ring with a draggable knob — drag to aim, tap to auto-aim & fire
 function drawFirePad() {
-  const b = btnShoot, col = PLAYER_COLOR;
+  const b = btnShoot, col = player.color || PLAYER_COLOR;
   ctx.globalAlpha = 0.85;
   ctx.fillStyle = b.pressed ? "rgba(20,70,92,0.6)" : "rgba(8,34,52,0.5)";
   ctx.beginPath(); ctx.arc(b.x, b.y, b.r, 0, TAU); ctx.fill();
@@ -2888,6 +3339,101 @@ function drawCredits() {
   ctx.textAlign = "left";
 }
 
+/* ---------- LOBBY (multiplayer) ---------- */
+function drawLobby() {
+  const S = ovScale(), cx = VIEW_W / 2;
+  ctx.fillStyle = "rgba(3,12,22,0.55)"; ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+  const pw = Math.min(VIEW_W * 0.86, 440 * S), ph = Math.min(VIEW_H * 0.92, 350 * S);
+  const x0 = cx - pw / 2, y0 = VIEW_H / 2 - ph / 2;
+  hudPanel(x0, y0, pw, ph);
+  ctx.textAlign = "center";
+  ctx.fillStyle = PLAYER_COLOR; ctx.font = "bold " + Math.round(24 * S) + "px 'Trebuchet MS'";
+  ctx.fillText("MULTIPLAYER", cx, y0 + 34 * S);
+
+  if (!net.mode) {
+    // host / join choice
+    ctx.fillStyle = "#9cc7da"; ctx.font = Math.round(9.5 * S) + "px monospace";
+    ctx.fillText("Free-for-all · up to 4 players · bots fill empty slots", cx, y0 + 60 * S);
+    const bw = pw * 0.62, bh = 40 * S; let by = y0 + 92 * S;
+    lobbyUI.host = { x: cx - bw / 2, y: by, w: bw, h: bh };
+    drawBtn(lobbyUI.host, "HOST GAME", PLAYER_COLOR, true, 16 * S); by += bh + 14 * S;
+    lobbyUI.join = { x: cx - bw / 2, y: by, w: bw, h: bh };
+    drawBtn(lobbyUI.join, "JOIN GAME", ENEMY_COLORS[0].ink, false, 16 * S); by += bh + 16 * S;
+    lobbyUI.back = { x: cx - bw / 2, y: by, w: bw, h: 30 * S };
+    drawBtn(lobbyUI.back, "BACK", "#7fb0c6", false, 12 * S);
+    lobbyUI.start = lobbyUI.ready = lobbyUI.leave = null;
+    if (!netAvailable()) {
+      ctx.fillStyle = "#e2724f"; ctx.font = Math.round(9 * S) + "px monospace";
+      ctx.fillText("Online needs a network connection (PeerJS).", cx, y0 + ph - 16 * S);
+    }
+  } else {
+    // room code + roster
+    ctx.fillStyle = "#7fb0c6"; ctx.font = "bold " + Math.round(9 * S) + "px monospace";
+    ctx.fillText(net.role === "host" ? "ROOM CODE — share it" : "ROOM CODE", cx, y0 + 56 * S);
+    ctx.fillStyle = "#ffd23d"; ctx.font = "bold " + Math.round(30 * S) + "px monospace";
+    ctx.fillText(net.roomCode || "…", cx, y0 + 86 * S);
+    ctx.fillStyle = "#9cc7da"; ctx.font = Math.round(9 * S) + "px monospace";
+    ctx.fillText(net.status || "", cx, y0 + 104 * S);
+
+    let ry = y0 + 128 * S;
+    const roster = net.players.length ? net.players : [{ faction: localFaction, name: "You", ready: true }];
+    ctx.textAlign = "left";
+    for (const pl of roster) {
+      const fc = FACTION_COLORS[pl.faction] || FACTION_COLORS[0];
+      ctx.fillStyle = fc.ink; ctx.fillRect(x0 + pw * 0.14, ry - 9 * S, 11 * S, 11 * S);
+      ctx.fillStyle = "#cfe9ff"; ctx.font = Math.round(11 * S) + "px monospace";
+      ctx.fillText(pl.name + (pl.faction === localFaction ? " (you)" : ""), x0 + pw * 0.14 + 17 * S, ry);
+      ctx.fillStyle = pl.ready ? "#62c748" : "#7fb0c6"; ctx.textAlign = "right";
+      ctx.fillText(pl.ready ? "READY" : "…", x0 + pw * 0.86, ry);
+      ctx.textAlign = "left"; ry += 19 * S;
+    }
+    ctx.textAlign = "center"; ctx.fillStyle = "#6f93a6"; ctx.font = Math.round(8.5 * S) + "px monospace";
+    ctx.fillText("Empty slots are filled by bots.", cx, ry + 8 * S);
+
+    const bw = pw * 0.40, bh = 34 * S, gap = pw * 0.04, byy = y0 + ph - 46 * S;
+    if (net.role === "host") {
+      lobbyUI.start = { x: cx - bw - gap / 2, y: byy, w: bw, h: bh };
+      drawBtn(lobbyUI.start, "START", PLAYER_COLOR, true, 15 * S);
+      lobbyUI.leave = { x: cx + gap / 2, y: byy, w: bw, h: bh };
+      drawBtn(lobbyUI.leave, "LEAVE", "#e2724f", false, 13 * S);
+      lobbyUI.ready = null;
+    } else {
+      const me = net.players.find(p => p.faction === localFaction);
+      const r = !!(me && me.ready);
+      lobbyUI.ready = { x: cx - bw - gap / 2, y: byy, w: bw, h: bh };
+      drawBtn(lobbyUI.ready, r ? "READY ✓" : "READY", r ? "#62c748" : ENEMY_COLORS[0].ink, r, 14 * S);
+      lobbyUI.leave = { x: cx + gap / 2, y: byy, w: bw, h: bh };
+      drawBtn(lobbyUI.leave, "LEAVE", "#e2724f", false, 13 * S);
+      lobbyUI.start = null;
+    }
+    lobbyUI.host = lobbyUI.join = lobbyUI.back = null;
+  }
+  ctx.textAlign = "left";
+}
+
+function lobbyTap(p) {
+  if (!net.mode) {
+    if (inR(p, lobbyUI.host)) { sfx("ui"); netHost(); }
+    else if (inR(p, lobbyUI.join)) {
+      sfx("ui");
+      const c = (typeof prompt === "function") ? prompt("Enter room code:") : "";
+      if (c && c.trim()) netJoin(c.trim().toUpperCase());
+    } else if (inR(p, lobbyUI.back)) { sfx("ui"); netReset(); game.state = "TITLE"; }
+    return;
+  }
+  if (net.role === "host") {
+    if (inR(p, lobbyUI.start)) { sfx("ui"); netStartHost(); }
+    else if (inR(p, lobbyUI.leave)) { sfx("ui"); netReset(); game.state = "TITLE"; }
+  } else {
+    if (inR(p, lobbyUI.ready)) {
+      sfx("ui");
+      const me = net.players.find(x => x.faction === localFaction);
+      const nr = !(me && me.ready); if (me) me.ready = nr;
+      if (net.hostConn && net.hostConn.open) { try { net.hostConn.send({ t: "ready", ready: nr }); } catch (e) {} }
+    } else if (inR(p, lobbyUI.leave)) { sfx("ui"); netReset(); game.state = "TITLE"; }
+  }
+}
+
 // Hero: big logo + mascot on a glow platform
 function drawTitleHero(cx, cy, S) {
   const titleY = cy - 64 * S;
@@ -2909,7 +3455,7 @@ function drawTitleHero(cx, cy, S) {
 
 // Menu card: stage selector + PLAY + HOW TO / SETTINGS
 function drawTitleMenu(cx, cy, S, w) {
-  const ph = 198 * S, px0 = cx - w / 2, py0 = cy - ph / 2;
+  const ph = 234 * S, px0 = cx - w / 2, py0 = cy - ph / 2;
   ctx.fillStyle = "rgba(6,20,34,0.72)"; rrect(px0, py0, w, ph);
   ctx.fillStyle = "rgba(110,225,255,0.08)"; rrect(px0, py0, w, Math.max(2, 3 * S));
   ctx.strokeStyle = "rgba(60,160,200,0.45)"; ctx.lineWidth = 2;
@@ -2943,7 +3489,12 @@ function drawTitleMenu(cx, cy, S, w) {
   const pbw = w * 0.72, pbh = 40 * S;
   titleBtns.play = { x: cx - pbw / 2, y: y, w: pbw, h: pbh };
   drawBtn(titleBtns.play, "PLAY", PLAYER_COLOR, true, 18 * S, 0.85 + 0.15 * Math.sin(bgT * 6));
-  y += pbh + 10 * S;
+  y += pbh + 8 * S;
+  // MULTIPLAYER (online free-for-all)
+  const mbh = 28 * S;
+  titleBtns.multi = { x: cx - pbw / 2, y: y, w: pbw, h: mbh };
+  drawBtn(titleBtns.multi, "MULTIPLAYER", ENEMY_COLORS[0].ink, false, 12 * S);
+  y += mbh + 8 * S;
   // HOW TO + SETTINGS side by side
   const sw = w * 0.35, gap = w * 0.04, sbh = 26 * S;
   titleBtns.how = { x: cx - sw - gap / 2, y: y, w: sw, h: sbh };
@@ -3262,10 +3813,16 @@ function drawResult(win) {
   const r = game.result || { total: 0, killScore: 0, coverScore: 0 };
 
   // build the four-faction standings
-  const facs = [{ n: "YOU", p: game.pct.player, c: PLAYER_COLOR, me: true }];
-  for (let i = 0; i < 3; i++) facs.push({ n: "Rival " + (i + 1), p: (game.pct.gangs && game.pct.gangs[i]) || 0, c: ENEMY_COLORS[i].ink });
+  const fp = game.pct.factions || [0, 0, 0, 0];
+  let rno = 0;
+  const facs = [];
+  for (let i = 0; i < 4; i++) {
+    const me = (i === localFaction);
+    facs.push({ n: me ? "YOU" : "Rival " + (++rno), p: fp[i] || 0, c: FACTION_COLORS[i].ink, me });
+  }
+  const meRow = facs[localFaction];
   const ranked = facs.slice().sort((a, b) => b.p - a.p);
-  const rank = ranked.indexOf(facs[0]) + 1;
+  const rank = ranked.indexOf(meRow) + 1;
   const ord = ["1st", "2nd", "3rd", "4th"];
 
   // title + placing

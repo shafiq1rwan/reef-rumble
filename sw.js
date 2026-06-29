@@ -1,10 +1,11 @@
 /* Reef Rumble service worker — offline + auto-update.
    Bump CACHE when you change cached assets to force a clean refresh. */
-const CACHE = "reef-rumble-v2";
+const CACHE = "reef-rumble-v3";
 const ASSETS = [
   "./",
   "./index.html",
   "./manifest.webmanifest",
+  "./vendor/peerjs.min.js",
   "./icon-192.png",
   "./icon-512.png",
   "./icon-maskable-512.png",

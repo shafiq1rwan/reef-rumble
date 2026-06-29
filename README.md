@@ -5,10 +5,11 @@ shark street-warrior in a neon reef city: cover the arena in your cyan sea-ink,
 splat rival shark gangs, dive into your own ink to zip around, and control the
 most territory before the timer runs out.
 
-Built as a **single self-contained `index.html`** - pure HTML, CSS, and vanilla
-JavaScript with Canvas 2D. **No libraries, no build step, no external assets,
-images, audio files, or network calls.** Everything (art, sound, physics) is
-generated procedurally in code.
+Built around a **single self-contained `index.html`** - pure HTML, CSS, and vanilla
+JavaScript with Canvas 2D. **No build step, and no external assets, images, or audio
+files** - everything (art, sound, physics) is generated procedurally in code. The
+only dependency is **PeerJS** (bundled locally in `vendor/`) for the optional online
+multiplayer; single-player makes no network calls at all.
 
 > Original work - not affiliated with or derived from any existing game. All
 > characters, names, art, UI, and sounds are made from scratch.
@@ -44,6 +45,29 @@ apply it. PWA files: `manifest.webmanifest`, `sw.js`, and the `icon-*.png` /
 
 > Just want to play? Opening `index.html` directly still works — you only lose the
 > install/offline extras.
+
+---
+
+## Multiplayer (online)
+
+Up to **4 players in a free-for-all** — every human is a colored faction, bots
+fill any empty slots, and whoever holds the most reef at `0:00` wins.
+
+1. On the title screen tap **MULTIPLAYER**.
+2. One player taps **HOST GAME** and shares the 5-character **room code**.
+3. The others tap **JOIN GAME** and enter that code.
+4. The host taps **START** — empty factions become bots.
+
+It runs **peer-to-peer over WebRTC** (via [PeerJS](https://peerjs.com/)). Only the
+one-time connection handshake uses PeerJS's free public broker; actual gameplay is
+direct between players, so it works from static hosting like **GitHub Pages**. The
+host is authoritative (simulates the match and streams ~18 snapshots/sec); clients
+send their input and render the synced world. PeerJS is bundled locally at
+`vendor/peerjs.min.js` (no CDN/runtime dependency, and it's offline-cached by the
+service worker). There's no TURN relay, so very strict/symmetric NATs may fail to
+connect — fine for most home and mobile networks.
+
+> Solo play is unchanged and fully offline — multiplayer is purely additive.
 
 ---
 
@@ -137,10 +161,14 @@ Three hand-designed, symmetric arenas (pick on the title screen):
 
 ```
 .
-├── index.html      # the entire game (HTML + CSS + JS)
-├── reference.png   # original HUD/stage art mock-up (reference only)
-├── CLAUDE.md       # contributor / code-structure notes
-└── README.md       # this file
+├── index.html              # the entire game (HTML + CSS + JS, incl. netcode)
+├── vendor/peerjs.min.js    # bundled PeerJS (WebRTC signaling for multiplayer)
+├── manifest.webmanifest    # PWA manifest
+├── sw.js                   # service worker (offline + auto-update)
+├── icon-*.png              # PWA icons (regen: node tools/gen-icons.cjs)
+├── reference.png           # original HUD/stage art mock-up (reference only)
+├── CLAUDE.md               # contributor / code-structure notes
+└── README.md               # this file
 ```
 
 ---
@@ -150,7 +178,8 @@ Three hand-designed, symmetric arenas (pick on the title screen):
 - More weapon types and a charge/roller alternate fire.
 - Additional arenas and selectable difficulty.
 - Background music (also synthesized, no files).
-- Online or local-multiplayer rivals.
+- Multiplayer polish: client-side prediction, a TURN fallback for strict NATs,
+  and in-lobby stage/weapon selection.
 
 ---
 
