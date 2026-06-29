@@ -1,0 +1,19 @@
+{
+  "name": "Reef Rumble — Shark Ink Arena",
+  "short_name": "Reef Rumble",
+  "description": "An original isometric pixel-art shark ink-battle arena. Cover the reef in cyan sea-ink and out-paint the rival shark gangs.",
+  "id": "reef-rumble",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "fullscreen",
+  "display_override": ["fullscreen", "standalone", "minimal-ui"],
+  "orientation": "landscape",
+  "background_color": "#04121f",
+  "theme_color": "#04121f",
+  "categories": ["games", "entertainment"],
+  "icons": [
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

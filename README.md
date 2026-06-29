@@ -28,6 +28,23 @@ Works on desktop and mobile browsers, in landscape (preferred) and portrait.
 *(Optional: serve it with any static server, e.g. `python -m http.server`, then
 open the shown URL - handy for testing on a phone over your local network.)*
 
+### Install as an app (PWA)
+
+The game ships as an installable, offline-capable **PWA**. To use those features it
+must be **served over http(s)** (a service worker can't run from a `file://` page):
+
+1. From the project folder run a static server, e.g. `python -m http.server 8080`.
+2. Open `http://localhost:8080/` (or your `https://` deploy, e.g. GitHub Pages).
+3. Use the browser's **Install** option (address-bar icon / "Add to Home Screen").
+
+Once installed it launches **fullscreen/standalone**, runs **offline**, and
+**auto-updates**: a new build is fetched on load/focus and the app reloads itself to
+apply it. PWA files: `manifest.webmanifest`, `sw.js`, and the `icon-*.png` /
+`apple-touch-icon.png` set (regenerate the icons with `node tools/gen-icons.cjs`).
+
+> Just want to play? Opening `index.html` directly still works — you only lose the
+> install/offline extras.
+
 ---
 
 ## Controls

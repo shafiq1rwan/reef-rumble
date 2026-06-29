@@ -4,13 +4,15 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
 <title>REEF RUMBLE — Shark Ink Arena</title>
-<!-- PWA: installable + standalone (manifest href is filled in at runtime via a Blob) -->
+<!-- PWA: installable + offline + standalone -->
 <meta name="theme-color" content="#04121f" />
 <meta name="mobile-web-app-capable" content="yes" />
 <meta name="apple-mobile-web-app-capable" content="yes" />
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
 <meta name="apple-mobile-web-app-title" content="Reef Rumble" />
-<link id="manifest" rel="manifest" />
+<link rel="manifest" href="manifest.webmanifest" />
+<link rel="icon" type="image/png" sizes="192x192" href="icon-192.png" />
+<link rel="apple-touch-icon" href="apple-touch-icon.png" />
 <style>
   /* ============================================================
      GLOBAL / LAYOUT
@@ -303,8 +305,14 @@ const titleBtns   = { play: null, how: null, settings: null };
 const weaponUI    = { prev: null, next: null, start: null, back: null };
 const settingsUI  = { music: null, sfx: null, back: null };
 const howtoUI     = { back: null };
-const pauseUI     = { resume: null, menu: null };
+const pauseUI     = { resume: null, menu: null, settings: null };
+let settingsFrom = "TITLE";                 // where the SETTINGS screen returns to
 function inR(p, r) { return r && p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h; }
+
+// PWA update toast state (set by the service-worker logic near boot)
+let updateReady = false, waitingWorker = null;
+const toastRect = { x: 0, y: 0, w: 0, h: 0 };
+function applyUpdate() { if (waitingWorker) waitingWorker.postMessage("skipWaiting"); }
 
 window.addEventListener("keydown", e => {
   initAudio();
@@ -317,7 +325,8 @@ window.addEventListener("keydown", e => {
     game.state = (game.state === "PLAYING") ? "PAUSED" : "PLAYING";
   if (k === "q" || k === "e") tryUlti();   // SPECIAL / ULTI
   if (k === "escape") {
-    if (game.state === "WEAPONSELECT" || game.state === "SETTINGS" || game.state === "HOWTO") game.state = "TITLE";
+    if (game.state === "SETTINGS") game.state = settingsFrom;
+    else if (game.state === "WEAPONSELECT" || game.state === "HOWTO") game.state = "TITLE";
     else if (game.state === "PLAYING") game.state = "PAUSED";
   }
   // left/right: stage on title, weapon on the select screen
@@ -336,6 +345,7 @@ canvas.addEventListener("mousedown", e => {
   initAudio();
   usingMouse = true;
   const p = toInternal(e.clientX, e.clientY);
+  if (updateReady && inR(p, toastRect)) { applyUpdate(); return; }
   if (game.state === "PLAYING") {
     const pbq = pauseBtn();
     if (inCircle(p.x, p.y, pbq.x, pbq.y, pbq.r + 8)) { game.state = "PAUSED"; return; }
@@ -354,7 +364,7 @@ function menuTap(p) {
       if (titleArrowHit(p)) return;
       if (inR(p, titleBtns.play)) { sfx("ui"); game.state = "WEAPONSELECT"; }
       else if (inR(p, titleBtns.how)) { sfx("ui"); game.state = "HOWTO"; }
-      else if (inR(p, titleBtns.settings)) { sfx("ui"); game.state = "SETTINGS"; }
+      else if (inR(p, titleBtns.settings)) { sfx("ui"); settingsFrom = "TITLE"; game.state = "SETTINGS"; }
       return;
     case "WEAPONSELECT":
       if (inR(p, weaponUI.prev)) cycleWeapon(-1);
@@ -365,7 +375,7 @@ function menuTap(p) {
     case "SETTINGS":
       if (inR(p, settingsUI.music)) { settings.music = !settings.music; saveSettings(); if (settings.music && audioCtx) musicNextTime = audioCtx.currentTime + 0.05; sfx("ui"); }
       else if (inR(p, settingsUI.sfx)) { settings.sfx = !settings.sfx; saveSettings(); sfx("ui"); }
-      else if (inR(p, settingsUI.back)) { sfx("ui"); game.state = "TITLE"; }
+      else if (inR(p, settingsUI.back)) { sfx("ui"); game.state = settingsFrom; }
       return;
     case "HOWTO":
       game.state = "TITLE"; sfx("ui"); return;   // tap anywhere closes
@@ -373,6 +383,7 @@ function menuTap(p) {
       game.state = "TITLE"; return;
     case "PAUSED": {
       if (inR(p, pauseUI.resume)) { sfx("ui"); game.state = "PLAYING"; }
+      else if (inR(p, pauseUI.settings)) { sfx("ui"); settingsFrom = "PAUSED"; game.state = "SETTINGS"; }
       else if (inR(p, pauseUI.menu)) { sfx("ui"); game.state = "TITLE"; }
       return;
     }
@@ -381,7 +392,9 @@ function menuTap(p) {
 function handleEnter() {
   if (game.state === "TITLE") game.state = "WEAPONSELECT";
   else if (game.state === "WEAPONSELECT") startMatch();
-  else if (game.state === "GAMEOVER" || game.state === "VICTORY" || game.state === "HOWTO" || game.state === "SETTINGS") game.state = "TITLE";
+  else if (game.state === "SETTINGS") game.state = settingsFrom;
+  else if (game.state === "HOWTO") game.state = "TITLE";
+  else if (game.state === "GAMEOVER" || game.state === "VICTORY") game.state = "TITLE";
 }
 
 // Title-screen stage selector (positions filled in by drawTitle each frame)
@@ -408,23 +421,29 @@ function titleArrowHit(p) {
    ============================================================ */
 const isTouch = ("ontouchstart" in window) || (navigator.maxTouchPoints > 0);
 
-// Virtual control state
-// ONE movement stick (left). Aiming follows your move direction and auto-locks
-// onto a nearby rival when you press FIRE — no second joystick needed.
+// Virtual control state. Left = movement stick. Right = FIRE pad which doubles
+// as an aim control: tap to fire (auto-aims), or drag to aim that direction.
 const moveStick = { active: false, id: -1, cx: 0, cy: 0, x: 0, y: 0, dx: 0, dy: 0, r: 60 };
-const btnShoot  = { x: 0, y: 0, r: 42, id: -1, pressed: false };
+const btnShoot  = { x: 0, y: 0, r: 42, id: -1, pressed: false, dx: 0, dy: 0 }; // aim+fire pad
 const btnDive   = { x: 0, y: 0, r: 36, id: -1, pressed: false };
 const btnUlti   = { x: 0, y: 0, r: 30, id: -1, pressed: false };
 
 function layoutMobileControls() {
   const u = (typeof UI === "number" && UI) ? UI : 1;
-  const m = 58 * u;
-  moveStick.cx = m + 6 * u; moveStick.cy = VIEW_H - m - 6 * u; moveStick.r = 50 * u;
+  const m = 60 * u;
+  moveStick.cx = m; moveStick.cy = VIEW_H - m; moveStick.r = 52 * u;
   moveStick.x = moveStick.cx; moveStick.y = moveStick.cy;
-  // right-hand action cluster (no aim stick now)
-  btnShoot.x = VIEW_W - 62 * u; btnShoot.y = VIEW_H - 66 * u; btnShoot.r = 34 * u; // primary FIRE
-  btnDive.x  = VIEW_W - 132 * u; btnDive.y = VIEW_H - 50 * u; btnDive.r  = 26 * u;
-  btnUlti.x  = VIEW_W - 70 * u;  btnUlti.y = VIEW_H - 142 * u; btnUlti.r = 27 * u;
+  // big FIRE/aim pad in the corner; DIVE & ULTI pulled well clear of it
+  btnShoot.x = VIEW_W - 66 * u; btnShoot.y = VIEW_H - 66 * u; btnShoot.r = 50 * u;
+  btnDive.x  = VIEW_W - 162 * u; btnDive.y = VIEW_H - 46 * u; btnDive.r = 27 * u;
+  btnUlti.x  = VIEW_W - 60 * u;  btnUlti.y = VIEW_H - 162 * u; btnUlti.r = 27 * u;
+}
+// set the aim direction from a touch on the fire pad (relative to its centre)
+function setFireDrag(p) {
+  let dx = p.x - btnShoot.x, dy = p.y - btnShoot.y;
+  const len = Math.hypot(dx, dy);
+  if (len > btnShoot.r) { dx = dx / len * btnShoot.r; dy = dy / len * btnShoot.r; }
+  btnShoot.dx = dx / btnShoot.r; btnShoot.dy = dy / btnShoot.r;
 }
 
 function inCircle(px, py, cx, cy, r) { return dist2(px, py, cx, cy) <= r*r; }
@@ -443,6 +462,7 @@ function onTouchStart(e) {
   usingMouse = false;   // switch to touch controls
   for (const t of e.changedTouches) {
     const p = toInternal(t.clientX, t.clientY);
+    if (updateReady && inR(p, toastRect)) { applyUpdate(); return; }
     // any non-gameplay screen routes through menuTap (plus weapon-swipe tracking)
     if (game.state !== "PLAYING") {
       if (game.state === "WEAPONSELECT") wsSwipe = { id: t.identifier, x: p.x };
@@ -452,12 +472,15 @@ function onTouchStart(e) {
     // pause button (top-right)
     const pbq = pauseBtn();
     if (inCircle(p.x, p.y, pbq.x, pbq.y, pbq.r + 10)) { game.state = "PAUSED"; return; }
-    // buttons first
-    if (inCircle(p.x, p.y, btnUlti.x, btnUlti.y, btnUlti.r + 8))   { btnUlti.id  = t.identifier; btnUlti.pressed = true; tryUlti(); continue; }
-    if (inCircle(p.x, p.y, btnShoot.x, btnShoot.y, btnShoot.r + 8)) { btnShoot.id = t.identifier; btnShoot.pressed = true; continue; }
-    if (inCircle(p.x, p.y, btnDive.x, btnDive.y, btnDive.r + 8))   { btnDive.id  = t.identifier; btnDive.pressed = true; continue; }
-    // movement stick — placed wherever the left thumb lands (left ~60% of screen)
-    if (p.x < VIEW_W * 0.6 && !moveStick.active) {
+    // small action buttons first (ULTI / DIVE)
+    if (inCircle(p.x, p.y, btnUlti.x, btnUlti.y, btnUlti.r + 8)) { btnUlti.id = t.identifier; btnUlti.pressed = true; tryUlti(); continue; }
+    if (inCircle(p.x, p.y, btnDive.x, btnDive.y, btnDive.r + 8)) { btnDive.id = t.identifier; btnDive.pressed = true; continue; }
+    // FIRE + aim pad: any touch on the lower-right starts firing; drag to aim
+    if (p.x > VIEW_W * 0.5 && p.y > VIEW_H * 0.4 && btnShoot.id < 0) {
+      btnShoot.id = t.identifier; btnShoot.pressed = true; setFireDrag(p); continue;
+    }
+    // movement stick: lower-left thumb
+    if (p.x < VIEW_W * 0.5 && !moveStick.active) {
       moveStick.active = true; moveStick.id = t.identifier;
       moveStick.cx = p.x; moveStick.cy = p.y; moveStick.x = p.x; moveStick.y = p.y; moveStick.dx = 0; moveStick.dy = 0;
     }
@@ -468,6 +491,7 @@ function onTouchMove(e) {
   for (const t of e.changedTouches) {
     const p = toInternal(t.clientX, t.clientY);
     if (t.identifier === moveStick.id) updateStick(moveStick, p);
+    else if (t.identifier === btnShoot.id) setFireDrag(p);
   }
 }
 function updateStick(s, p) {
@@ -489,7 +513,7 @@ function onTouchEnd(e) {
       wsSwipe = null;
     }
     if (t.identifier === moveStick.id) { moveStick.active = false; moveStick.id = -1; moveStick.dx = 0; moveStick.dy = 0; }
-    if (t.identifier === btnShoot.id)  { btnShoot.id = -1; btnShoot.pressed = false; }
+    if (t.identifier === btnShoot.id)  { btnShoot.id = -1; btnShoot.pressed = false; btnShoot.dx = 0; btnShoot.dy = 0; }
     if (t.identifier === btnDive.id)   { btnDive.id = -1; btnDive.pressed = false; }
     if (t.identifier === btnUlti.id)   { btnUlti.id = -1; btnUlti.pressed = false; }
   }
@@ -936,10 +960,14 @@ function updatePlayer(dt) {
 
   // --- aim ---
   if (isTouch && !usingMouse) {
-    // single-stick aiming (touch): lock onto the nearest rival while firing,
-    // otherwise aim in the direction you're moving (last facing kept when idle)
+    // FIRE pad controls the aim: drag it to point that way; a plain tap auto-aims
+    // the nearest rival; otherwise aim where you're moving.
     let aimed = false;
-    if (btnShoot.pressed && !player.diving) {
+    const dragMag = Math.abs(btnShoot.dx) + Math.abs(btnShoot.dy);
+    if (btnShoot.pressed && dragMag > 0.3) {
+      const w = screenToWorld(btnShoot.dx, btnShoot.dy);     // screen drag -> world dir
+      player.aim = Math.atan2(w.y, w.x); aimed = true;
+    } else if (btnShoot.pressed && !player.diving) {
       let best = null, bd = 8;
       for (const e of enemies) { if (e.dead) continue; const d = dist(player.x, player.y, e.x, e.y); if (d < bd) { bd = d; best = e; } }
       if (best) { player.aim = Math.atan2(best.y - player.y, best.x - player.x); aimed = true; }
@@ -1753,6 +1781,30 @@ function endMatch() {
    18. RENDER LOOP
    ============================================================ */
 function render() {
+  renderScene();
+  drawUpdateToast();   // always on top, on every screen
+}
+
+// "UPDATE READY — TAP TO REFRESH" banner (PWA), shown when a new build installed
+function drawUpdateToast() {
+  if (!updateReady) { toastRect.w = 0; return; }
+  const S = ovScale();
+  const txt = "UPDATE READY · TAP TO REFRESH";
+  ctx.font = "bold " + Math.round(10 * S) + "px monospace";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  const w = ctx.measureText(txt).width + 26 * S, h = 24 * S;
+  const x = Math.round(VIEW_W / 2 - w / 2), y = Math.round(64 * S);
+  toastRect.x = x; toastRect.y = y; toastRect.w = w; toastRect.h = h;
+  ctx.fillStyle = "rgba(7,22,36,0.96)"; rrect(x, y, w, h);
+  ctx.globalAlpha = 0.6 + 0.4 * Math.sin(bgT * 6);
+  ctx.strokeStyle = "#ffd23d"; ctx.lineWidth = Math.max(1, 1.5 * S);
+  ctx.strokeRect(x + 0.5, y + 0.5, w, h);
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = "#ffd23d"; ctx.fillText(txt, VIEW_W / 2, y + h / 2 + 1);
+  ctx.textBaseline = "alphabetic"; ctx.textAlign = "left";
+}
+
+function renderScene() {
   // clear with deep-ocean background
   ctx.fillStyle = "#06182a";
   ctx.fillRect(0, 0, VIEW_W, VIEW_H);
@@ -2552,10 +2604,15 @@ function drawHUD() {
   }
   ctx.textAlign = "left";
 
-  // ===== gear / pause button (top-right) =====
+  // ===== pause button (top-right) — clean two-bar pause glyph =====
   const pb = pauseBtn();
-  ctx.fillStyle = "rgba(7,22,36,0.85)"; ctx.beginPath(); ctx.arc(pb.x, pb.y, pb.r + 2 * UI, 0, TAU); ctx.fill();
-  drawGear(pb.x, pb.y, pb.r, "#ffd23d");
+  ctx.fillStyle = "rgba(7,22,36,0.9)"; ctx.beginPath(); ctx.arc(pb.x, pb.y, pb.r + 2 * UI, 0, TAU); ctx.fill();
+  ctx.strokeStyle = "rgba(60,196,228,0.8)"; ctx.lineWidth = Math.max(1.5, 1.6 * UI);
+  ctx.beginPath(); ctx.arc(pb.x, pb.y, pb.r + 2 * UI, 0, TAU); ctx.stroke();
+  ctx.fillStyle = "#bfe9ff";
+  const pbarW = Math.max(2, pb.r * 0.32), pbarH = pb.r * 1.05, pbarG = pb.r * 0.34;
+  rrect(pb.x - pbarG - pbarW, pb.y - pbarH / 2, pbarW, pbarH);
+  rrect(pb.x + pbarG, pb.y - pbarH / 2, pbarW, pbarH);
 
   // ===== dead overlay (fades in so the death VFX is visible first) =====
   if (player.dead) {
@@ -2612,7 +2669,7 @@ function actionBtn(b, color, label, ready) {
 }
 function drawMobileControls() {
   drawStick(moveStick, "#2ccada");
-  actionBtn(btnShoot, PLAYER_COLOR, "FIRE", false);
+  drawFirePad();
   actionBtn(btnDive, "#3dff8a", "DIVE", false);
   const ultiReady = player.special >= 100;
   ctx.save();
@@ -2620,6 +2677,28 @@ function drawMobileControls() {
   actionBtn(btnUlti, ultiReady ? "#ffd23d" : "#b56bff", "ULTI", ultiReady);
   ctx.restore();
   ctx.textAlign = "left";
+}
+// FIRE pad: a ring with a draggable knob — drag to aim, tap to auto-aim & fire
+function drawFirePad() {
+  const b = btnShoot, col = PLAYER_COLOR;
+  ctx.globalAlpha = 0.85;
+  ctx.fillStyle = b.pressed ? "rgba(20,70,92,0.6)" : "rgba(8,34,52,0.5)";
+  ctx.beginPath(); ctx.arc(b.x, b.y, b.r, 0, TAU); ctx.fill();
+  ctx.strokeStyle = col; ctx.lineWidth = Math.max(2, 2.5 * UI);
+  ctx.beginPath(); ctx.arc(b.x, b.y, b.r, 0, TAU); ctx.stroke();
+  // aim direction line when dragging
+  const dragMag = Math.hypot(b.dx, b.dy);
+  if (b.pressed && dragMag > 0.3) {
+    ctx.strokeStyle = "rgba(190,255,255,0.7)"; ctx.lineWidth = Math.max(2, 3 * UI);
+    ctx.beginPath(); ctx.moveTo(b.x, b.y); ctx.lineTo(b.x + b.dx * b.r, b.y + b.dy * b.r); ctx.stroke();
+  }
+  // knob
+  const kx = b.x + b.dx * b.r * 0.7, ky = b.y + b.dy * b.r * 0.7;
+  ctx.fillStyle = b.pressed ? shade(col, -0.15) : "rgba(150,200,220,0.5)";
+  ctx.beginPath(); ctx.arc(kx, ky, b.r * 0.4, 0, TAU); ctx.fill();
+  ctx.fillStyle = b.pressed ? "#06202b" : "#eaffff"; ctx.font = hudFont(9); ctx.textAlign = "center";
+  ctx.fillText("FIRE", kx, ky + 3 * UI);
+  ctx.globalAlpha = 1;
 }
 function drawStick(s, color) {
   ctx.globalAlpha = 0.7;
@@ -2979,27 +3058,31 @@ function drawPause() {
   const S = ovScale(), cx = VIEW_W / 2, cy = VIEW_H / 2;
   ctx.fillStyle = "rgba(4,14,24,0.82)"; ctx.fillRect(0, 0, VIEW_W, VIEW_H);
   // card
-  const pw = Math.min(VIEW_W * 0.86, 344 * S), ph = 172 * S;
+  const pw = Math.min(VIEW_W * 0.86, 344 * S), ph = 204 * S;
   const px0 = cx - pw / 2, py0 = cy - ph / 2;
   hudPanel(px0, py0, pw, ph);
   ctx.textAlign = "center";
   // pause glyph (two bars) + title
   ctx.fillStyle = PLAYER_COLOR;
-  ctx.fillRect(Math.round(cx - 11 * S), Math.round(py0 + 22 * S), Math.round(7 * S), Math.round(20 * S));
-  ctx.fillRect(Math.round(cx + 4 * S), Math.round(py0 + 22 * S), Math.round(7 * S), Math.round(20 * S));
+  ctx.fillRect(Math.round(cx - 11 * S), Math.round(py0 + 20 * S), Math.round(7 * S), Math.round(20 * S));
+  ctx.fillRect(Math.round(cx + 4 * S), Math.round(py0 + 20 * S), Math.round(7 * S), Math.round(20 * S));
   ctx.fillStyle = PLAYER_COLOR; ctx.font = "bold " + Math.round(24 * S) + "px 'Trebuchet MS'";
-  ctx.fillText("PAUSED", cx, py0 + 64 * S);
+  ctx.fillText("PAUSED", cx, py0 + 62 * S);
   // stage + time remaining
   const t = Math.max(0, Math.ceil(game.time));
   const ts = Math.floor(t / 60) + ":" + (t % 60 < 10 ? "0" : "") + (t % 60);
   ctx.fillStyle = "#7fb0c6"; ctx.font = "bold " + Math.round(10 * S) + "px monospace";
-  ctx.fillText(LAYOUT_NAMES[currentLayout] + "   ·   " + ts + " left", cx, py0 + 80 * S);
-  // side-by-side buttons
-  const bw = pw * 0.42, bh = 40 * S, gap = pw * 0.06, by = py0 + ph - bh - 20 * S;
+  ctx.fillText(LAYOUT_NAMES[currentLayout] + "   ·   " + ts + " left", cx, py0 + 78 * S);
+  // RESUME + MAIN MENU side by side
+  const bw = pw * 0.42, bh = 38 * S, gap = pw * 0.06, by = py0 + 98 * S;
   pauseUI.resume = { x: cx - gap / 2 - bw, y: by, w: bw, h: bh };
   pauseUI.menu   = { x: cx + gap / 2, y: by, w: bw, h: bh };
   drawBtn(pauseUI.resume, "RESUME", "#37e07a", true, 15 * S, 0.85 + 0.15 * Math.sin(bgT * 6));
   drawBtn(pauseUI.menu, "MAIN MENU", "#ff8a8a", false, 13 * S);
+  // SETTINGS below
+  const sbw = pw * 0.6, sbh = 30 * S, sby = by + bh + 10 * S;
+  pauseUI.settings = { x: cx - sbw / 2, y: sby, w: sbw, h: sbh };
+  drawBtn(pauseUI.settings, "SETTINGS", "#7fb0c6", false, 12 * S);
   // hint
   ctx.fillStyle = "#5a8aa0"; ctx.font = Math.round(8 * S) + "px monospace";
   ctx.fillText(isTouch ? "tap a button to continue" : "P or Esc resumes", cx, py0 + ph - 7 * S);
@@ -3067,32 +3150,31 @@ function frame(now) {
   requestAnimationFrame(frame);
 }
 
-// ---- PWA: install manifest (built at runtime so the file stays self-contained) ----
-(function setupPWA() {
-  try {
-    const icon = "data:image/svg+xml," + encodeURIComponent(
-      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">' +
-      '<rect width="512" height="512" rx="96" fill="#04121f"/>' +
-      '<ellipse cx="270" cy="280" rx="170" ry="160" fill="#3a86b8"/>' +
-      '<path d="M205 120 Q240 30 320 120 Z" fill="#2a6791"/>' +
-      '<ellipse cx="300" cy="320" rx="110" ry="64" fill="#cfeaf8"/>' +
-      '<rect x="150" y="245" width="270" height="34" rx="17" fill="#0e2c36"/>' +
-      '<circle cx="232" cy="262" r="46" fill="#fff" stroke="#2ccada" stroke-width="11"/>' +
-      '<circle cx="338" cy="262" r="46" fill="#fff" stroke="#2ccada" stroke-width="11"/>' +
-      '<circle cx="246" cy="262" r="21" fill="#06202b"/><circle cx="352" cy="262" r="21" fill="#06202b"/>' +
-      '</svg>');
-    const manifest = {
-      name: "Reef Rumble — Shark Ink Arena", short_name: "Reef Rumble",
-      description: "Original isometric shark ink-battle arena.",
-      start_url: location.href, scope: "./", display: "standalone",
-      orientation: "landscape", background_color: "#04121f", theme_color: "#04121f",
-      icons: [{ src: icon, sizes: "any", type: "image/svg+xml", purpose: "any maskable" }],
-    };
-    const url = URL.createObjectURL(new Blob([JSON.stringify(manifest)], { type: "application/manifest+json" }));
-    const link = document.getElementById("manifest");
-    if (link) link.href = url;
-  } catch (e) { /* manifest is best-effort */ }
-})();
+// ---- PWA: service worker — offline + auto-update (needs http/https) ----
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("sw.js").then((reg) => {
+      // check for a new version on load, on focus, and every minute
+      const poll = () => reg.update().catch(() => {});
+      poll();
+      setInterval(poll, 60 * 1000);
+      window.addEventListener("focus", poll);
+      // a new worker installed while we're already controlled = update available.
+      // Surface a tap-to-refresh toast instead of reloading mid-game.
+      const onUpdate = (nw) => nw && nw.addEventListener("statechange", () => {
+        if (nw.state === "installed" && navigator.serviceWorker.controller) { waitingWorker = nw; updateReady = true; }
+      });
+      if (reg.waiting && navigator.serviceWorker.controller) { waitingWorker = reg.waiting; updateReady = true; }
+      reg.addEventListener("updatefound", () => onUpdate(reg.installing));
+    }).catch(() => { /* offline unavailable on file:// — serve over http(s) */ });
+
+    // when the (user-accepted) new worker takes control, reload once to apply it
+    let reloaded = false;
+    navigator.serviceWorker.addEventListener("controllerchange", () => {
+      if (reloaded) return; reloaded = true; location.reload();
+    });
+  });
+}
 
 // boot
 resize();
