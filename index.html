@@ -812,7 +812,7 @@ function startMatch() {
   player.weapon = WEAPONS[weaponSel]; player.weaponIdx = weaponSel;   // equip the chosen weapon
   enemies = [makeEnemy(0), makeEnemy(1), makeEnemy(2)];
   projectiles.length = 0; particles.length = 0; floaters.length = 0; impacts.length = 0;
-  pickups.length = 0; pickupTimer = 4; flashes.length = 0; auras.length = 0;
+  pickups.length = 0; pickupTimer = 4; flashes.length = 0; auras.length = 0; inkStorm = null;
   game.time = MATCH_TIME;
   game.shake = 0; game.flash = 0;
   game.countdown = 3.0;      // 3 · 2 · 1 · GO! intro
@@ -1053,21 +1053,73 @@ function tryUlti() {
   if (player.special < 100) return;
   player.special = 0;
   player.ink = INK_MAX;
-  player.ultiFlash = 0.6;
-  player.iframe = Math.max(player.iframe, 0.4); // brief safety on cast
-  game.shake = Math.min(14, game.shake + 10);
+  player.ultiFlash = 0.4;
+  player.iframe = Math.max(player.iframe, 0.5); // brief safety on cast
+  game.shake = Math.min(14, game.shake + 11);
   // big paint burst in expanding rings
   for (let r = 1.4; r <= 5.0; r += 0.7) paintTiles(player.x, player.y, r, OWN_PLAYER, PLAYER_COLOR);
   // damage + knock enemies in range
   for (const e of enemies)
     if (!e.dead && dist(player.x, player.y, e.x, e.y) < 5.0) damageEnemy(e, 45);
-  // particle ring
-  for (let i = 0; i < 40; i++) {
-    const a = (i / 40) * TAU;
-    spawnParticle(player.x, player.y, Math.cos(a) * rand(3, 7), Math.sin(a) * rand(3, 7), PLAYER_COLOR, rand(0.5, 1.0), rand(2, 4));
-  }
-  spawnFloater(player.x, player.y - 1.5, "INK STORM!", PLAYER_COLOR);
+  startInkStorm(player.x, player.y);
+  spawnFloater(player.x, player.y - 1.8, "INK STORM!", PLAYER_COLOR);
   sfx("ulti");
+}
+
+/* INK STORM — an animated swirling vortex with expanding shockwave rings, a
+   spiralling ink cyclone and a glowing core, instead of a flat screen flash. */
+let inkStorm = null;
+function startInkStorm(x, y) {
+  inkStorm = { x, y, t: 0.85, max: 0.85 };
+  // initial outward burst + a rising ink geyser
+  for (let i = 0; i < 46; i++) {
+    const a = (i / 46) * TAU, sp = rand(3, 8.5);
+    spawnParticle(x, y, Math.cos(a) * sp, Math.sin(a) * sp, i % 4 === 0 ? "#eaffff" : PLAYER_COLOR, rand(0.5, 1.0), rand(2, 4), 0.3);
+  }
+  for (let i = 0; i < 14; i++)
+    spawnParticle(x + rand(-0.6, 0.6), y, rand(-1, 1), rand(-2, -0.6), PLAYER_COLOR, rand(0.6, 1.1), rand(2, 3.5), 0.45);
+}
+function updateInkStorm(dt) {
+  if (!inkStorm) return;
+  inkStorm.t -= dt;
+  if (inkStorm.t <= 0) { inkStorm = null; return; }
+  const age = 1 - inkStorm.t / inkStorm.max;
+  // continuous cyclone: a few tangential (swirling) particles per frame
+  for (let i = 0; i < 4; i++) {
+    const a = age * TAU * 3 + i * 1.7 + rand(-0.2, 0.2);
+    const rad = 0.5 + age * 4.6;
+    const px = inkStorm.x + Math.cos(a) * rad, py = inkStorm.y + Math.sin(a) * rad;
+    const tx = -Math.sin(a), ty = Math.cos(a);     // tangential = swirl
+    spawnParticle(px, py, tx * 3.4 + Math.cos(a) * 1.4, ty * 3.4 + Math.sin(a) * 1.4,
+      i === 0 ? "#eaffff" : PLAYER_COLOR, rand(0.3, 0.6), rand(1.5, 3), 0.2);
+  }
+}
+function drawInkStorm() {
+  if (!inkStorm) return;
+  const s = project(inkStorm.x, inkStorm.y);
+  const age = 1 - inkStorm.t / inkStorm.max;       // 0..1
+  const alpha = inkStorm.t / inkStorm.max;         // fade out
+  const maxR = Math.min(VIEW_W, VIEW_H) * 0.42;
+  ctx.save();
+  // staggered expanding shockwave rings
+  for (let k = 0; k < 3; k++) {
+    const rt = clamp(age * 1.3 - k * 0.22, 0, 1);
+    if (rt <= 0 || rt >= 1) continue;
+    const rad = rt * maxR;
+    ctx.globalAlpha = (1 - rt) * 0.55 * alpha;
+    ctx.strokeStyle = (k % 2) ? "#eaffff" : PLAYER_COLOR;
+    ctx.lineWidth = (3 - rt * 2) * UI;
+    ctx.beginPath(); ctx.ellipse(s.x, s.y, rad, rad * 0.5, 0, 0, TAU); ctx.stroke();
+  }
+  // glowing vortex core
+  const coreR = (26 + Math.sin(age * 30) * 5) * UI * (0.7 + 0.5 * (1 - age));
+  const grd = ctx.createRadialGradient(s.x, s.y - 6, 0, s.x, s.y - 6, coreR);
+  grd.addColorStop(0, "rgba(220,255,255," + (0.55 * alpha) + ")");
+  grd.addColorStop(0.5, "rgba(44,202,218," + (0.32 * alpha) + ")");
+  grd.addColorStop(1, "rgba(44,202,218,0)");
+  ctx.globalAlpha = 1; ctx.fillStyle = grd;
+  ctx.fillRect(s.x - coreR, s.y - 6 - coreR, coreR * 2, coreR * 2);
+  ctx.restore();
 }
 
 /* ============================================================
@@ -1641,6 +1693,7 @@ function update(dt) {
   updateImpacts(dt);
   updateFlashes(dt);
   updateAuras(dt);
+  updateInkStorm(dt);
   updatePickups(dt);
   updateTerritory(dt);
   updateCamera(dt);
@@ -1703,9 +1756,9 @@ function render() {
     ctx.fillStyle = "rgba(255,40,40," + (game.flash * 0.4) + ")";
     ctx.fillRect(0, 0, VIEW_W, VIEW_H);
   }
-  // ulti (ink storm) gold flash
+  // ulti (ink storm) — a soft cyan bloom, gentle now that the vortex does the work
   if (game.state === "PLAYING" && player.ultiFlash > 0) {
-    ctx.fillStyle = "rgba(255,210,61," + (player.ultiFlash * 0.35) + ")";
+    ctx.fillStyle = "rgba(120,235,255," + (player.ultiFlash * 0.18) + ")";
     ctx.fillRect(0, 0, VIEW_W, VIEW_H);
   }
 }
@@ -1903,6 +1956,7 @@ function drawArena() {
   drawFlashes();
   drawAuras();
   drawParticles();
+  drawInkStorm();
   drawFloaters();
 }
 
