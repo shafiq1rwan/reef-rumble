@@ -4,6 +4,13 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
 <title>REEF RUMBLE — Shark Ink Arena</title>
+<!-- PWA: installable + standalone (manifest href is filled in at runtime via a Blob) -->
+<meta name="theme-color" content="#04121f" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="Reef Rumble" />
+<link id="manifest" rel="manifest" />
 <style>
   /* ============================================================
      GLOBAL / LAYOUT
@@ -2639,75 +2646,104 @@ function fitFont(text, maxW, maxPx, family) {
   return px;
 }
 
+const STAGE_DESC = [
+  "Corner forts around a sunken ink pool.",
+  "Open water, a reef island & light cover.",
+  "Tight reef corridors for cat & mouse.",
+];
+
 function drawTitle() {
   bgT += 0.01;
   const cx = VIEW_W / 2, cy = VIEW_H / 2;
-  // uniform layout scale so everything stays proportional at any window size
-  const S = clamp(Math.min(VIEW_W / 520, VIEW_H / 360), 0.55, 1.6);
+  const S = clamp(Math.min(VIEW_W / 640, VIEW_H / 400), 0.5, 1.5);
+  const wide = VIEW_W > VIEW_H * 1.2;   // two-column in landscape, stacked in portrait
 
-  // floating bubbles backdrop (scaled)
+  // floating bubbles backdrop + a soft darken so the UI reads
   for (let i = 0; i < 18; i++) {
     const bx = (i * 53 + bgT * 30) % VIEW_W;
     const by = VIEW_H - ((bgT * 40 + i * 70) % VIEW_H);
-    ctx.fillStyle = "rgba(120,220,255,0.13)";
+    ctx.fillStyle = "rgba(120,220,255,0.12)";
     ctx.beginPath(); ctx.arc(bx, by, (2 + (i % 3)) * S, 0, TAU); ctx.fill();
   }
+  ctx.fillStyle = "rgba(3,12,22,0.34)"; ctx.fillRect(0, 0, VIEW_W, VIEW_H);
 
-  // centered content card — keeps the layout tidy in any aspect ratio
-  const panelW = Math.min(VIEW_W * 0.92, 540 * S);
-  const panelH = Math.min(VIEW_H * 0.92, 420 * S);
-  const px0 = cx - panelW / 2, py0 = cy - panelH / 2;
-  ctx.fillStyle = "rgba(6,20,34,0.62)";
-  rrect(px0, py0, panelW, panelH);
-  ctx.strokeStyle = "rgba(60,160,200,0.4)"; ctx.lineWidth = 2;
-  ctx.strokeRect(Math.round(px0) + 0.5, Math.round(py0) + 0.5, Math.round(panelW), Math.round(panelH));
+  if (wide) {
+    drawTitleHero(VIEW_W * 0.30, cy, S);
+    drawTitleMenu(VIEW_W * 0.71, cy, S, Math.min(VIEW_W * 0.44, 380 * S));
+  } else {
+    drawTitleHero(cx, VIEW_H * 0.30, S * 0.92);
+    drawTitleMenu(cx, VIEW_H * 0.70, S, Math.min(VIEW_W * 0.9, 360 * S));
+  }
 
+  // footer hint
   ctx.textAlign = "center";
+  ctx.fillStyle = "rgba(160,210,230,0.5)"; ctx.font = Math.round(8 * S) + "px monospace";
+  ctx.fillText(isTouch ? "Tap PLAY to dive in" : "Click PLAY or press ENTER", cx, VIEW_H - 9 * S);
+  ctx.textAlign = "left";
+}
 
-  // --- title (auto-fit to card width) ---
-  const titleY = py0 + panelH * 0.20;
-  const tpx = fitFont("REEF RUMBLE", panelW * 0.84, 56 * S);
+// Hero: big logo + mascot on a glow platform
+function drawTitleHero(cx, cy, S) {
+  const titleY = cy - 64 * S;
+  const tw = Math.min(VIEW_W * 0.52, 460 * S);
+  ctx.textAlign = "center";
+  const tpx = fitFont("REEF RUMBLE", tw, 52 * S);
   ctx.font = "bold " + tpx + "px 'Trebuchet MS', sans-serif";
   ctx.fillStyle = "#06202b"; ctx.fillText("REEF RUMBLE", cx + 2, titleY + 2);
   ctx.fillStyle = PLAYER_COLOR; ctx.fillText("REEF RUMBLE", cx, titleY);
-  // subtitle
-  const subpx = Math.max(10, tpx * 0.32);
-  ctx.font = "bold " + subpx + "px 'Trebuchet MS', sans-serif";
-  ctx.fillStyle = ENEMY_COLORS[0].ink;
-  ctx.fillText("S H A R K   I N K   A R E N A", cx, titleY + subpx + 10 * S);
+  ctx.font = "bold " + Math.max(9, tpx * 0.28) + "px 'Trebuchet MS', sans-serif";
+  ctx.fillStyle = ENEMY_COLORS[0].ink; ctx.fillText("SHARK  INK  ARENA", cx, titleY + tpx * 0.55);
+  // glow platform + mascot
+  const my = cy + 58 * S;
+  ctx.fillStyle = "rgba(25,230,255,0.10)"; ctx.beginPath(); ctx.ellipse(cx, my + 14 * S, 58 * S, 15 * S, 0, 0, TAU); ctx.fill();
+  ctx.fillStyle = "rgba(25,230,255,0.06)"; ctx.beginPath(); ctx.ellipse(cx, my + 14 * S, 80 * S, 22 * S, 0, 0, TAU); ctx.fill();
+  drawTitleShark(cx, my, S * 1.05);
+  ctx.textAlign = "left";
+}
 
-  // --- mascot shark ---
-  drawTitleShark(cx, py0 + panelH * 0.50, S * 1.0);
+// Menu card: stage selector + PLAY + HOW TO / SETTINGS
+function drawTitleMenu(cx, cy, S, w) {
+  const ph = 198 * S, px0 = cx - w / 2, py0 = cy - ph / 2;
+  ctx.fillStyle = "rgba(6,20,34,0.72)"; rrect(px0, py0, w, ph);
+  ctx.fillStyle = "rgba(110,225,255,0.08)"; rrect(px0, py0, w, Math.max(2, 3 * S));
+  ctx.strokeStyle = "rgba(60,160,200,0.45)"; ctx.lineWidth = 2;
+  ctx.strokeRect(Math.round(px0) + 0.5, Math.round(py0) + 0.5, Math.round(w), Math.round(ph));
 
-  // --- stage selector ( ◀  Reef City  ▶ ) ---
-  const selY = py0 + panelH * 0.68;
-  ctx.fillStyle = "#7fb0c6"; ctx.font = Math.max(8, 9 * S) + "px monospace";
-  ctx.fillText("STAGE", cx, selY - 12 * S);
-  const selpx = Math.max(12, 15 * S);
-  ctx.font = "bold " + selpx + "px 'Trebuchet MS', sans-serif";
-  const name = LAYOUT_NAMES[currentLayout];
-  const nameW = ctx.measureText(name).width;
-  ctx.fillStyle = PLAYER_COLOR; ctx.fillText(name, cx, selY + selpx * 0.35);
-  // arrow buttons (triangles) flanking the name
-  const ax = nameW / 2 + 22 * S;
-  titleUI.lx = cx - ax; titleUI.rx = cx + ax; titleUI.y = selY; titleUI.r = Math.max(16, 16 * S);
+  ctx.textAlign = "center";
+  let y = py0 + 24 * S;
+  ctx.fillStyle = "#7fb0c6"; ctx.font = "bold " + Math.round(9 * S) + "px monospace";
+  ctx.fillText("SELECT STAGE", cx, y); y += 22 * S;
+  // stage name + flanking arrows
+  ctx.fillStyle = PLAYER_COLOR; ctx.font = "bold " + Math.round(18 * S) + "px 'Trebuchet MS', sans-serif";
+  ctx.fillText(LAYOUT_NAMES[currentLayout], cx, y);
+  const ax = w * 0.40;
+  titleUI.lx = cx - ax; titleUI.rx = cx + ax; titleUI.y = y - 5 * S; titleUI.r = Math.max(16, 17 * S);
   ctx.fillStyle = "#19e6ff";
-  poly(titleUI.lx, titleUI.y, [[7 * S, -8 * S], [7 * S, 8 * S], [-7 * S, 0]]);   // ◀
-  poly(titleUI.rx, titleUI.y, [[-7 * S, -8 * S], [-7 * S, 8 * S], [7 * S, 0]]);  // ▶
-  ctx.fillStyle = "#7fb0c6"; ctx.font = Math.max(7, 8 * S) + "px monospace";
-  ctx.fillText(isTouch ? "tap arrows to change" : "◀ ▶ / A D to change", cx, selY + selpx * 0.35 + 14 * S);
-
-  // --- buttons: PLAY (primary) + HOW TO PLAY / SETTINGS ---
-  const pulse = 0.5 + 0.5 * Math.sin(bgT * 6);
-  const pbw = panelW * 0.5, pbh = 36 * S, pby = py0 + panelH * 0.76;
-  titleBtns.play = { x: cx - pbw / 2, y: pby, w: pbw, h: pbh };
-  drawBtn(titleBtns.play, "PLAY", PLAYER_COLOR, true, 18 * S, 0.85 + pulse * 0.15);
-  const sw = panelW * 0.44, gap = panelW * 0.04, sby = pby + pbh + 10 * S, sbh = 26 * S;
-  titleBtns.how = { x: cx - sw - gap / 2, y: sby, w: sw, h: sbh };
-  titleBtns.settings = { x: cx + gap / 2, y: sby, w: sw, h: sbh };
-  drawBtn(titleBtns.how, "HOW TO PLAY", "#7fb0c6", false, 11 * S);
+  poly(titleUI.lx, titleUI.y, [[7 * S, -8 * S], [7 * S, 8 * S], [-7 * S, 0]]);
+  poly(titleUI.rx, titleUI.y, [[-7 * S, -8 * S], [-7 * S, 8 * S], [7 * S, 0]]);
+  y += 15 * S;
+  // description (auto-fit)
+  const desc = STAGE_DESC[currentLayout] || "";
+  let fs = 9 * S; ctx.font = Math.round(fs) + "px monospace";
+  while (ctx.measureText(desc).width > w * 0.84 && fs > 6) { fs--; ctx.font = Math.round(fs) + "px monospace"; }
+  ctx.fillStyle = "#9cc7da"; ctx.fillText(desc, cx, y); y += 12 * S;
+  // page dots
+  for (let i = 0; i < LAYOUT_NAMES.length; i++) {
+    ctx.fillStyle = i === currentLayout ? PLAYER_COLOR : "rgba(150,200,220,0.35)";
+    ctx.beginPath(); ctx.arc(cx + (i - (LAYOUT_NAMES.length - 1) / 2) * 12 * S, y, 3 * S, 0, TAU); ctx.fill();
+  }
+  y += 18 * S;
+  // PLAY
+  const pbw = w * 0.72, pbh = 40 * S;
+  titleBtns.play = { x: cx - pbw / 2, y: y, w: pbw, h: pbh };
+  drawBtn(titleBtns.play, "PLAY", PLAYER_COLOR, true, 18 * S, 0.85 + 0.15 * Math.sin(bgT * 6));
+  y += pbh + 10 * S;
+  // HOW TO + SETTINGS side by side
+  const sw = w * 0.35, gap = w * 0.04, sbh = 26 * S;
+  titleBtns.how = { x: cx - sw - gap / 2, y: y, w: sw, h: sbh };
+  titleBtns.settings = { x: cx + gap / 2, y: y, w: sw, h: sbh };
+  drawBtn(titleBtns.how, "HOW TO", "#7fb0c6", false, 11 * S);
   drawBtn(titleBtns.settings, "SETTINGS", "#7fb0c6", false, 11 * S);
-
   ctx.textAlign = "left";
 }
 
@@ -3019,16 +3055,44 @@ function frame(now) {
   lastT = now;
   dt = Math.min(dt, 0.05); // clamp big gaps (tab switches)
 
-  // orientation hint for very narrow portrait phones
+  // orientation hint only matters during play (the menus support portrait)
   const hint = document.getElementById("rotateHint");
-  if (isTouch && window.innerHeight > window.innerWidth * 1.3) hint.style.display = "flex";
+  const inPlay = (game.state === "PLAYING" || game.state === "PAUSED");
+  if (isTouch && inPlay && window.innerHeight > window.innerWidth * 1.3) hint.style.display = "flex";
   else hint.style.display = "none";
 
   update(dt);
   render();
-  updateMusic();   // schedule background-music notes (no-op if muted)
+  updateMusic();    // schedule background-music notes (no-op if muted)
   requestAnimationFrame(frame);
 }
+
+// ---- PWA: install manifest (built at runtime so the file stays self-contained) ----
+(function setupPWA() {
+  try {
+    const icon = "data:image/svg+xml," + encodeURIComponent(
+      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">' +
+      '<rect width="512" height="512" rx="96" fill="#04121f"/>' +
+      '<ellipse cx="270" cy="280" rx="170" ry="160" fill="#3a86b8"/>' +
+      '<path d="M205 120 Q240 30 320 120 Z" fill="#2a6791"/>' +
+      '<ellipse cx="300" cy="320" rx="110" ry="64" fill="#cfeaf8"/>' +
+      '<rect x="150" y="245" width="270" height="34" rx="17" fill="#0e2c36"/>' +
+      '<circle cx="232" cy="262" r="46" fill="#fff" stroke="#2ccada" stroke-width="11"/>' +
+      '<circle cx="338" cy="262" r="46" fill="#fff" stroke="#2ccada" stroke-width="11"/>' +
+      '<circle cx="246" cy="262" r="21" fill="#06202b"/><circle cx="352" cy="262" r="21" fill="#06202b"/>' +
+      '</svg>');
+    const manifest = {
+      name: "Reef Rumble — Shark Ink Arena", short_name: "Reef Rumble",
+      description: "Original isometric shark ink-battle arena.",
+      start_url: location.href, scope: "./", display: "standalone",
+      orientation: "landscape", background_color: "#04121f", theme_color: "#04121f",
+      icons: [{ src: icon, sizes: "any", type: "image/svg+xml", purpose: "any maskable" }],
+    };
+    const url = URL.createObjectURL(new Blob([JSON.stringify(manifest)], { type: "application/manifest+json" }));
+    const link = document.getElementById("manifest");
+    if (link) link.href = url;
+  } catch (e) { /* manifest is best-effort */ }
+})();
 
 // boot
 resize();
