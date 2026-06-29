@@ -102,13 +102,16 @@ const OWN_NONE   = 0;
 const OWN_PLAYER = 1;
 const OWN_ENEMY  = 2;
 
-// Colors
-const PLAYER_COLOR      = "#19e6ff";
-const PLAYER_COLOR_DARK = "#0c8fb5";
+// Colors — ink stays bright-ish cyan; the shark BODY is a calmer shark-blue.
+// (Toned down overall so the arena doesn't feel over-bright.)
+const PLAYER_COLOR      = "#2ccada";   // cyan sea-ink (projectiles / tiles / UI)
+const PLAYER_COLOR_DARK = "#157f90";
+const PLAYER_BODY       = "#4aa3d4";   // shark-blue character body
+const PLAYER_BODY_DARK  = "#2a6791";
 const ENEMY_COLORS = [
-  { ink: "#ff3df0", dark: "#a01da0", body: "#ff7ae0" },  // magenta gang
-  { ink: "#ffd23d", dark: "#b58c10", body: "#ffe079" },  // gold gang
-  { ink: "#7cff4d", dark: "#3f9e22", body: "#aaff8a" },  // lime gang
+  { ink: "#d94bc0", dark: "#84287a", body: "#b06aa0" },  // magenta gang
+  { ink: "#d6ab3d", dark: "#8f6e14", body: "#c2a05c" },  // gold gang
+  { ink: "#62c748", dark: "#357f23", body: "#84bd6e" },  // lime gang
 ];
 
 // Decoration sub-types for obstacles (visual only)
@@ -1520,17 +1523,118 @@ function render() {
   }
 }
 
-// Animated subtle water background (cheap, pixel-friendly)
+/* ---------- ANIMATED OCEAN (drawn BEFORE the stage so the arena floats) ----------
+   Lightweight: navy depth bands + two parallax layers of drifting wave dashes +
+   seeded twinkling sparkles + rising bubbles + cyan/magenta ink-reflection glow
+   under the stage + animated foam framing the stage rim. All loops smoothly. */
 let bgT = 0;
 function drawWaterBackground() {
-  bgT += 0.005;
-  const bands = 8;
+  bgT += 0.01;
+  const t = bgT;
+  const parX = camera.x * 0.3, parY = camera.y * 0.3;   // gentle parallax with camera
+
+  // 1) deep navy base + slow depth bands
+  ctx.fillStyle = "#020c18";
+  ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+  const bands = 7;
   for (let i = 0; i < bands; i++) {
-    const y = (i / bands) * VIEW_H;
-    const shadeAmt = 0.04 * Math.sin(bgT + i * 0.7);
-    ctx.fillStyle = shade("#06182a", shadeAmt + 0.02);
-    ctx.fillRect(0, y, VIEW_W, VIEW_H / bands + 1);
+    const y = Math.floor(i / bands * VIEW_H), h = Math.ceil(VIEW_H / bands) + 1;
+    ctx.fillStyle = shade("#06192e", 0.03 + 0.05 * Math.sin(t * 0.5 + i * 0.6));
+    ctx.fillRect(0, y, VIEW_W, h);
   }
+
+  // 2) drifting wave dashes — two parallax layers for depth
+  drawWaveLayer(t * 0.7, parX,       parY,       30, 46, "rgba(70,160,210,0.10)", 0.0);
+  drawWaveLayer(t * 1.1, parX * 1.4, parY * 1.4, 38, 60, "rgba(120,200,235,0.07)", 0.5);
+
+  // 3) seeded twinkling sparkles (positions fixed, brightness animates)
+  let sd = 0x51ED0;
+  const sr = () => { sd = (sd * 1664525 + 1013904223) >>> 0; return sd / 4294967296; };
+  for (let i = 0; i < 36; i++) {
+    const rx = sr(), ry = sr(), rp = sr(), rc = sr();
+    const tw = Math.sin(t * 3 + rp * TAU);
+    if (tw > 0.45) {
+      ctx.globalAlpha = ((tw - 0.45) / 0.55) * 0.85;
+      ctx.fillStyle = rc > 0.5 ? "#cdf6ff" : "#8fd0ff";
+      const x = ((rx * VIEW_W - parX * 0.15) % VIEW_W + VIEW_W) % VIEW_W;
+      const s = tw > 0.85 ? 2 : 1;
+      ctx.fillRect(x | 0, (ry * VIEW_H) | 0, s, s);
+    }
+  }
+  ctx.globalAlpha = 1;
+
+  // 4) tiny rising bubbles (seeded, wrap-around)
+  sd = 0xB0BB1E;
+  for (let i = 0; i < 16; i++) {
+    const rx = sr(), spd = sr(), rr = sr(), wob = sr();
+    const x = ((rx * VIEW_W - parX * 0.2 + Math.sin(t * 1.4 + wob * TAU) * 6) % VIEW_W + VIEW_W) % VIEW_W;
+    const y = VIEW_H - ((t * (10 + spd * 22) + wob * 240) % (VIEW_H + 30));
+    const r = 1 + Math.floor(rr * 2.2);
+    ctx.globalAlpha = 0.16; ctx.strokeStyle = "#9fd8ff"; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.arc(x | 0, y | 0, r, 0, TAU); ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+
+  // 5) ink reflection glow + foam rim around the stage (only during play)
+  if (game.state !== "TITLE") {
+    const ctr = project(MAP_W / 2 - 0.5, MAP_H / 2 - 0.5);
+    waterGlow(ctr.x - 50, ctr.y + 24, 260, "25,230,255", 0.45 + game.pct.player / 130);
+    waterGlow(ctr.x + 50, ctr.y + 24, 260, "255,61,240", 0.45 + game.pct.enemy / 130);
+    drawStageFoam(t, ctr);
+  }
+}
+
+function drawWaveLayer(t, parX, parY, rowGap, dashGap, color, off) {
+  ctx.fillStyle = color;
+  const ox = ((parX % dashGap) + dashGap) % dashGap;
+  const oy = ((parY % rowGap) + rowGap) % rowGap;
+  for (let ry = -rowGap; ry < VIEW_H + rowGap; ry += rowGap) {
+    const baseY = ry - oy, phase = t + ry * 0.05 + off;
+    for (let dx = -dashGap; dx < VIEW_W + dashGap; dx += dashGap) {
+      const x = dx - ox + Math.sin(phase + dx * 0.03) * 6;
+      const len = 12 + Math.sin(phase * 1.3 + dx * 0.05) * 6;
+      const y = baseY + Math.sin(phase + dx * 0.02) * 3;
+      ctx.fillRect(x | 0, y | 0, len | 0, 2);
+    }
+  }
+}
+
+function waterGlow(x, y, r, rgb, strength) {
+  strength = clamp(strength, 0, 1);
+  if (strength <= 0.02) return;
+  const g = ctx.createRadialGradient(x, y, 0, x, y, r);
+  g.addColorStop(0, "rgba(" + rgb + "," + (0.16 * strength).toFixed(3) + ")");
+  g.addColorStop(1, "rgba(" + rgb + ",0)");
+  ctx.fillStyle = g;
+  ctx.fillRect(x - r, y - r, r * 2, r * 2);
+}
+
+function drawStageFoam(t, ctr) {
+  const hw = TILE_W / 2, hh = TILE_H / 2;
+  const N = project(0, 0); N.y -= hh;
+  const E = project(MAP_W - 1, 0); E.x += hw;
+  const S = project(MAP_W - 1, MAP_H - 1); S.y += hh;
+  const Wv = project(0, MAP_H - 1); Wv.x -= hw;
+  foamEdge(N.x, N.y, E.x, E.y, ctr.x, ctr.y, t);
+  foamEdge(E.x, E.y, S.x, S.y, ctr.x, ctr.y, t);
+  foamEdge(S.x, S.y, Wv.x, Wv.y, ctr.x, ctr.y, t);
+  foamEdge(Wv.x, Wv.y, N.x, N.y, ctr.x, ctr.y, t);
+}
+function foamEdge(ax, ay, bx, by, cx, cy, t) {
+  const segs = 22;
+  for (let i = 0; i <= segs; i++) {
+    const u = i / segs;
+    let x = ax + (bx - ax) * u, y = ay + (by - ay) * u;
+    let ox = x - cx, oy = y - cy; const ol = Math.hypot(ox, oy) || 1; ox /= ol; oy /= ol;
+    const wave = Math.sin(t * 3 + i * 0.8 + (ax + ay) * 0.012);
+    const push = 2 + Math.max(0, wave) * 4;
+    x += ox * push; y += oy * push;
+    ctx.globalAlpha = 0.22 + 0.4 * Math.max(0, wave);
+    ctx.fillStyle = (i % 4 === 0) ? "#eaffff" : "#a9e0ff";
+    const s = wave > 0.4 ? 2 : 1;
+    ctx.fillRect(x | 0, y | 0, s + 1, s);
+  }
+  ctx.globalAlpha = 1;
 }
 
 // Raycast where a shot from (x,y) along ang would first land (obstacle or range end)
@@ -1771,8 +1875,8 @@ function poly(cx, cy, pts) {
 function drawShark(ent, isPlayer) {
   const p = project(ent.x, ent.y);
   let px = Math.round(p.x), py = Math.round(p.y);
-  const col = isPlayer ? PLAYER_COLOR : ent.body;
-  const dark = isPlayer ? PLAYER_COLOR_DARK : ent.dark;
+  const col = isPlayer ? PLAYER_BODY : ent.body;
+  const dark = isPlayer ? PLAYER_BODY_DARK : ent.dark;
   const ink  = isPlayer ? PLAYER_COLOR : ent.color;
 
   // i-frame blink
@@ -1812,67 +1916,106 @@ function drawShark(ent, isPlayer) {
     return;
   }
 
-  // ================= HUMANOID SHARK (bipedal warrior) =================
-  // Drawn facing-right at a local origin on the FEET; ctx.scale handles the
-  // left/right flip and the squash-&-stretch. Local +x = forward, -y = up.
+  // ============ CHIBI SHARK STREET-WARRIOR (big round head, tiny body) ============
+  // Drawn facing-right from a local origin on the FEET; ctx.scale handles the
+  // left/right flip + squash/stretch. Local +x = forward, -y = up.
   const bob = Math.sin(ent.walkPhase) * 1.0;
-  const stride = Math.sin(ent.walkPhase) * 2.4;
+  const moving = (Math.abs(ent.vx) + Math.abs(ent.vy)) > 0.5;
+  const wag = Math.sin(ent.walkPhase * 1.2 + bgT * 5) * (moving ? 0.55 : 0.3);
   const belly = shade(col, 0.30);
+  const shell = "#e3c79a", shellSh = "#bd986a", coral = "#d98f86", weed = "#3fae5a";
+  const neon = ink;  // goggles + accents glow in the team ink colour
   ctx.save();
-  ctx.translate(px, py + 4 + bob);
+  ctx.translate(px, py + 3 + bob);
   ctx.scale(face * sq, st);
 
-  // tail stub (lower back)
-  ctx.fillStyle = dark; poly(-6, -10, [[0, -7], [0, 3], [-11, -2]]);
+  // --- wagging TAIL (behind, low) ---
+  ctx.fillStyle = dark;
+  poly(-8, -7, [[2, -4], [2, 4], [-10, -2 + wag * 9]]);
 
-  // legs (back leg first, then front, with a walking stride)
-  ctx.fillStyle = shade(col, -0.14);
-  rrect(-6, -12 + stride * 0.35, 6, 12);           // back leg
-  ctx.fillStyle = "#0a2630"; rrect(-8, -1 + stride * 0.35, 8, 3); // back foot-fin
-  ctx.fillStyle = col;
-  rrect(1, -12 - stride * 0.35, 6, 12);            // front leg
-  ctx.fillStyle = "#0c2d39"; rrect(0, -1 - stride * 0.35, 9, 3);  // front foot-fin
+  // --- tiny LEGS + seaweed ankle wraps ---
+  ctx.fillStyle = shade(col, -0.12);
+  rrect(-4, -7, 4, 7); rrect(1, -7, 4, 7);
+  ctx.fillStyle = "#0b2935"; rrect(-5, -1, 6, 2); rrect(1, -1, 6, 2);
+  ctx.fillStyle = weed; rrect(-4, -4.5, 4, 1.5); rrect(1, -4.5, 4, 1.5);
 
-  // back arm (behind torso)
-  ctx.fillStyle = dark; rrect(-9, -26, 4, 12);
+  // --- back arm ---
+  ctx.fillStyle = dark; rrect(-7, -15, 3, 7);
 
-  // dorsal fin rising off the back
-  ctx.fillStyle = dark; poly(-5, -27, [[0, 3], [-4, -14], [7, -1]]);
+  // --- tiny TORSO with coral-shell armour ---
+  ctx.fillStyle = col; rrect(-6, -16, 12, 10);
+  ctx.fillStyle = belly; rrect(-3, -13, 6, 6);
+  ctx.fillStyle = shell; poly(0, -16, [[-6, 1], [6, 1], [5, 7], [0, 9], [-5, 7]]); // chest plate
+  ctx.fillStyle = shellSh; rrect(-6, -16, 12, 2);   // collar
+  ctx.fillStyle = coral; rrect(-1, -15, 2, 8);      // centre ridge
+  // shell shoulder pads
+  ctx.fillStyle = shell;
+  ctx.beginPath(); ctx.arc(-6, -15, 3, 0, TAU); ctx.fill();
+  ctx.beginPath(); ctx.arc(6, -15, 3, 0, TAU); ctx.fill();
+  ctx.fillStyle = coral;
+  ctx.beginPath(); ctx.arc(-6, -15, 1.3, 0, TAU); ctx.fill();
+  ctx.beginPath(); ctx.arc(6, -15, 1.3, 0, TAU); ctx.fill();
+  if (!isPlayer) { ctx.fillStyle = ink; rrect(-6, -9, 12, 2); } // gang sash
 
-  // torso
-  ctx.fillStyle = col; rrect(-7, -28, 15, 17);
-  ctx.fillStyle = belly; rrect(-3, -24, 9, 12);     // belly plate
-  ctx.fillStyle = shade(col, -0.16); rrect(-7, -28, 15, 4); // chest shade
-  if (!isPlayer) { ctx.fillStyle = ink; rrect(-7, -21, 15, 3); } // gang sash
+  // --- BIG ROUND HEAD ---
+  const hy = -27;
+  ctx.fillStyle = dark; poly(-3, hy - 9, [[0, 2], [-4, -9], [7, -1]]); // dorsal mohawk fin
+  ctx.fillStyle = col; ctx.beginPath(); ctx.ellipse(0, hy, 12, 11, 0, 0, TAU); ctx.fill();
+  ctx.fillStyle = belly; ctx.beginPath(); ctx.ellipse(2, hy + 5, 8, 5, 0, 0, Math.PI); ctx.fill(); // jaw
+  ctx.fillStyle = shade(col, 0.18); ctx.beginPath(); ctx.ellipse(-4, hy - 6, 4, 2.5, 0, 0, TAU); ctx.fill(); // forehead shine
+  ctx.fillStyle = col; ctx.beginPath(); ctx.ellipse(11, hy + 3, 4, 4, 0, 0, TAU); ctx.fill(); // snout
+  ctx.fillStyle = shade(col, -0.28); rrect(2, hy + 6, 11, 1.4);   // smiling mouth
+  ctx.fillStyle = "#ffffff"; for (let i = 0; i < 4; i++) ctx.fillRect(4 + i * 2.4, hy + 6, 1.4, 1.6); // small teeth
+  ctx.fillStyle = shade(col, -0.34); for (let i = 0; i < 3; i++) ctx.fillRect(-9 + i * 1.6, hy + 1, 1, 4); // gills
 
-  // head
-  const hy = -43;
-  ctx.fillStyle = col; rrect(-7, hy, 15, 16);
-  ctx.fillStyle = shade(col, -0.16); rrect(-7, hy, 15, 4);
-  // snout jutting forward
-  ctx.fillStyle = col; poly(8, hy + 5, [[0, -3], [0, 11], [11, 4]]);
-  // jagged teeth under the snout
+  // --- BIG EYES + NEON GOGGLES ---
+  ctx.fillStyle = "#0e2c36"; rrect(-12, hy - 4, 24, 3);          // goggle strap
+  ctx.fillStyle = shade(neon, 0.12); rrect(-12, hy - 4, 24, 1);  // neon strap glow
+  const ex1 = -3, ex2 = 5, eyy = hy - 1;
   ctx.fillStyle = "#ffffff";
-  for (let i = 0; i < 4; i++) ctx.fillRect(7 + i * 3, hy + 13, 2, 2);
-  // gill slits behind the eye
-  ctx.fillStyle = shade(col, -0.38);
-  for (let i = 0; i < 3; i++) ctx.fillRect(-5 + i * 2, hy + 7, 1, 5);
-  // big forward eye + angry brow
-  ctx.fillStyle = "#ffffff"; rrect(1, hy + 4, 7, 7);
-  ctx.fillStyle = "#06202b"; rrect(4, hy + 5, 3, 5);
-  ctx.fillStyle = "#bff6ff"; ctx.fillRect(5, hy + 6, 1, 1);
-  ctx.fillStyle = shade(col, -0.3); poly(1, hy + 3, [[0, 0], [7, 0], [7, -2]]);
-  // gang headband for enemies
-  if (!isPlayer) { ctx.fillStyle = ink; rrect(-7, hy + 2, 15, 2); }
+  ctx.beginPath(); ctx.arc(ex1, eyy, 3.4, 0, TAU); ctx.fill();
+  ctx.beginPath(); ctx.arc(ex2, eyy, 3.4, 0, TAU); ctx.fill();
+  ctx.fillStyle = "#06202b";
+  ctx.beginPath(); ctx.arc(ex1 + 1, eyy, 1.7, 0, TAU); ctx.fill();
+  ctx.beginPath(); ctx.arc(ex2 + 1, eyy, 1.7, 0, TAU); ctx.fill();
+  ctx.fillStyle = "#cdf6ff"; ctx.fillRect(ex1, eyy - 1, 1, 1); ctx.fillRect(ex2, eyy - 1, 1, 1);
+  ctx.strokeStyle = neon; ctx.lineWidth = 1.5;                   // neon goggle rims
+  ctx.beginPath(); ctx.arc(ex1, eyy, 4.2, 0, TAU); ctx.stroke();
+  ctx.beginPath(); ctx.arc(ex2, eyy, 4.2, 0, TAU); ctx.stroke();
+  ctx.fillStyle = neon; rrect(ex1 + 3.5, eyy - 0.5, 2, 1);       // goggle bridge
 
-  // front arm reaching to the blaster
-  ctx.fillStyle = col; rrect(5, -26, 5, 11);
-  ctx.fillStyle = belly; rrect(6, -18, 4, 4);       // hand
+  // --- front arm + seaweed wrist wrap ---
+  ctx.fillStyle = col; rrect(4, -15, 4, 7);
+  ctx.fillStyle = weed; rrect(4, -10, 4, 2);
+  ctx.fillStyle = belly; rrect(5, -9, 3, 3);
 
   ctx.restore();
 
-  // coral/shell blaster held in the front hand, aimed in world space
-  drawBlaster(px, py - 16 + bob, ent.aim, ink, dark);
+  // shell-and-coral sea-ink blaster, held low in the front hand, aimed in world space
+  drawBlaster(px, py - 9 + bob, ent.aim, ink, dark);
+
+  // floating identity tag above the head
+  const ty = py - 48 + Math.sin(bgT * 4 + ent.x * 1.7) * 1.2;
+  if (isPlayer) {
+    // cyan "YOU" with a downward pointer
+    ctx.textAlign = "center";
+    ctx.font = "bold 8px monospace";
+    ctx.fillStyle = "#06202b"; ctx.fillText("YOU", px + 1, ty + 1);
+    ctx.fillStyle = PLAYER_COLOR; ctx.fillText("YOU", px, ty);
+    ctx.fillStyle = "#06202b"; poly(px, ty + 8, [[-5, -4], [5, -4], [0, 4]]);
+    ctx.fillStyle = PLAYER_COLOR; poly(px, ty + 7, [[-4, -4], [4, -4], [0, 3]]);
+    ctx.textAlign = "left";
+  } else {
+    // numbered gang badge in the rival's ink colour
+    const n = ((ent.id != null ? ent.id : 0) + 1);
+    ctx.fillStyle = "#06202b"; ctx.beginPath(); ctx.arc(px, ty, 6.5, 0, TAU); ctx.fill();
+    ctx.fillStyle = ink; ctx.beginPath(); ctx.arc(px, ty, 5, 0, TAU); ctx.fill();
+    ctx.fillStyle = "#06202b"; poly(px, ty + 7, [[-3, -3], [3, -3], [0, 3]]); // pointer
+    ctx.fillStyle = "#06202b"; ctx.font = "bold 8px monospace";
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText(String(n), px, ty + 1);
+    ctx.textBaseline = "alphabetic"; ctx.textAlign = "left";
+  }
 
   // ink-drip droplets when moving fast
   if ((Math.abs(ent.vx) + Math.abs(ent.vy)) > 4 && Math.random() < 0.2)
@@ -2210,7 +2353,7 @@ function drawTitle() {
 // Big chibi-shark mascot for the title, scaled by S (drawn around cx,cy)
 function drawTitleShark(cx, cy, S) {
   S = S || 1;
-  const col = PLAYER_COLOR, dark = PLAYER_COLOR_DARK, ink = PLAYER_COLOR;
+  const col = PLAYER_BODY, dark = PLAYER_BODY_DARK, ink = PLAYER_COLOR;
   const bob = Math.sin(bgT * 3) * 3;
   ctx.save();
   ctx.translate(cx, cy + bob);
