@@ -328,6 +328,12 @@ try {
 applyPalette();   // apply the saved palette before anything draws
 function saveSettings() { try { localStorage.setItem("reefRumble.settings", JSON.stringify(settings)); } catch (e) {} }
 
+// player display name for multiplayer lobbies (persisted)
+let playerName = "Player";
+try { const n = localStorage.getItem("reefRumble.name"); if (n) playerName = n; } catch (e) {}
+function sanitizeName(s) { return (s || "").replace(/[^\x20-\x7E]/g, "").trim().slice(0, 12) || "Player"; }
+function setPlayerName(s) { playerName = sanitizeName(s); try { localStorage.setItem("reefRumble.name", playerName); } catch (e) {} }
+
 /* ---- BACKGROUND MUSIC (synthesised loop, no files) ---- */
 let musicGain = null, musicStep = 0, musicNextTime = 0;
 const MUSIC_BPM = 96;
@@ -373,7 +379,8 @@ let usingMouse = false;
 // menu hit-rects (filled in each frame by the matching draw function)
 const titleBtns   = { play: null, multi: null, how: null, settings: null, credits: null };
 const creditsUI   = { back: null };
-const lobbyUI     = { host: null, join: null, back: null, start: null, ready: null, leave: null };
+const lobbyUI     = { host: null, join: null, back: null, start: null, ready: null, leave: null,
+                      name: null, wPrev: null, wNext: null, sPrev: null, sNext: null };
 const weaponUI    = { prev: null, next: null, start: null, back: null };
 const settingsUI  = { music: null, sfx: null, colorblind: null, perf: null, back: null };
 const howtoUI     = { back: null };
@@ -2055,7 +2062,7 @@ function netHost() {
   netReset();
   net.role = "host"; net.mode = "host"; net.status = "Creating room…";
   net.roomCode = genCode();
-  net.players = [{ faction: 0, name: "You (Host)", ready: true, isLocal: true, weaponIdx: weaponSel }];
+  net.players = [{ faction: 0, name: playerName, ready: true, isLocal: true, weaponIdx: weaponSel }];
   net.peer = new Peer(NET_ID_PREFIX + net.roomCode);
   net.peer.on("open", () => { net.status = "Room ready — share the code"; });
   net.peer.on("error", (e) => {
@@ -2102,6 +2109,9 @@ function hostOnData(conn, msg) {
     if (allPlayersReady()) net.status = "Everyone's ready — tap START";
     else net.status = "Room ready — share the code";
     netBroadcast(rosterMsg());
+  } else if (msg.t === "weapon") {
+    const p = net.players.find(x => x.faction === f);
+    if (p && msg.weaponIdx != null) p.weaponIdx = msg.weaponIdx;
   } else if (msg.t === "input" && net.started) {
     const sh = sharks[f];
     if (sh) sh.netInput = msg.in;
@@ -2150,7 +2160,7 @@ function netJoin(code) {
     net.hostConn = conn;
     conn.on("open", () => {
       net.status = "Connected — waiting in lobby";
-      conn.send({ t: "join", name: "Player", weaponIdx: weaponSel });
+      conn.send({ t: "join", name: playerName, weaponIdx: weaponSel });
     });
     conn.on("data", (d) => clientOnData(d));
     conn.on("close", () => clientLostHost());
@@ -2170,6 +2180,8 @@ function clientOnData(msg) {
     net.status = "In lobby — faction " + msg.faction;
   } else if (msg.t === "lobby") {
     net.players = msg.roster.map(p => ({ ...p, isLocal: p.faction === localFaction }));
+  } else if (msg.t === "stage") {
+    if (msg.stage != null) currentLayout = msg.stage;   // host changed the arena
   } else if (msg.t === "start") {
     if (msg.stage != null) currentLayout = msg.stage;
     net.started = true;
@@ -2289,14 +2301,72 @@ function gatherNetInput() {
   return { ix: +ix.toFixed(2), iy: +iy.toFixed(2), aim: +aim.toFixed(3), fire, dive, ulti };
 }
 
+// (client) Predict the LOCAL shark's movement immediately from live input, using
+// the same primitives the host runs (speedForTile / moveEntity), so your own shark
+// responds with zero round-trip lag. Movement only — host stays authoritative for
+// ink / hp / paint / shooting; netClientTick reconciles drift against snapshots.
+function predictLocalShark(dt) {
+  const sh = player;
+  // gather movement input (mirrors updatePlayer / gatherNetInput)
+  let ix = 0, iy = 0;
+  if (keys["w"] || keys["arrowup"]) iy -= 1;
+  if (keys["s"] || keys["arrowdown"]) iy += 1;
+  if (keys["a"] || keys["arrowleft"]) ix -= 1;
+  if (keys["d"] || keys["arrowright"]) ix += 1;
+  if (moveStick.active) { ix += moveStick.dx; iy += moveStick.dy; }
+  let wx = (ix + iy), wy = (iy - ix);     // screen-axis -> world-axis
+  const il = Math.hypot(wx, wy);
+  if (il > 0.001) { wx /= il; wy /= il; }
+  const inMag = Math.min(1, Math.hypot(ix, iy));
+
+  const tHere = tileAt(Math.floor(sh.x), Math.floor(sh.y));
+  const teamHere = tHere ? tHere.team : -1;
+
+  // dive (same rule as updatePlayer; affects predicted speed feel)
+  const wantDive = keys["shift"] || btnDive.pressed;
+  const onOwnInk = teamHere === sh.faction;
+  if (wantDive && onOwnInk) sh.diving = true;
+  if (!wantDive || !onOwnInk) sh.diving = false;
+
+  sh.speed = speedForTile(sh, teamHere, sh.diving);
+  if (sh.speedBoost > 0) sh.speed *= 1.4;
+  const sp = sh.speed * inMag;
+  sh.vx = wx * sp; sh.vy = wy * sp;
+  if (il > 0.001) { moveEntity(sh, sh.vx, sh.vy, dt); sh.walkPhase += dt * 10; }
+
+  // face the way we aim (aim is already set locally in gatherNetInput)
+  const scr = worldToScreen(Math.cos(sh.aim), Math.sin(sh.aim));
+  sh.facing = scr.x >= 0 ? 1 : -1;
+}
+
 // (client) smooth toward the latest authoritative shark transforms + run VFX only
 function netClientTick(dt) {
   if (net.lastSnap) { netApply(net.lastSnap); net.lastSnap = null; }
-  // interpolate shark positions toward their net targets
+  // --- local shark: predict movement now, reconcile against the snapshot ---
+  if (player.netX != null) {
+    if (player.dead || game.countdown > 0) {
+      // dead/frozen: no prediction — sit at the authoritative position
+      player.x = player.netX; player.y = player.netY;
+    } else {
+      predictLocalShark(dt);
+      const ex = player.netX - player.x, ey = player.netY - player.y;
+      if (Math.hypot(ex, ey) > 1.5) {          // respawn / knockback / big desync → snap
+        player.x = player.netX; player.y = player.netY;
+      } else {                                  // normal drift → gently correct (invisible)
+        const c = Math.min(1, dt * 6);
+        player.x += ex * c; player.y += ey * c;
+      }
+    }
+    if (player.ultiFlash > 0) player.ultiFlash -= dt;
+    if (player.popIn > 0) player.popIn -= dt;
+    player.squash = lerp(player.squash || 0, 0, dt * 10);
+  }
+  // --- other sharks: interpolate toward their net targets ---
   const k = Math.min(1, dt * 14);
   for (const sh of sharks) {
+    if (sh === player) continue;
     if (sh.netX != null) { sh.x += (sh.netX - sh.x) * k; sh.y += (sh.netY - sh.y) * k; }
-    if (sh !== player && sh.netAim != null) sh.aim = sh.netAim;
+    if (sh.netAim != null) sh.aim = sh.netAim;
     if (sh.ultiFlash > 0) sh.ultiFlash -= dt;
     if (sh.popIn > 0) sh.popIn -= dt;
     sh.squash = lerp(sh.squash || 0, 0, dt * 10);
@@ -3372,10 +3442,55 @@ function drawCredits() {
 }
 
 /* ---------- LOBBY (multiplayer) ---------- */
+// A "◀  LABEL: value  ▶" picker row. Draws a small caption, the value, and two
+// triangle arrows; returns the { prev, next } hit-rects (null arrows when disabled).
+function lobbySelectorRow(cx, y, halfW, label, value, S, enabled) {
+  ctx.textAlign = "center";
+  ctx.fillStyle = "#7fb0c6"; ctx.font = "bold " + Math.round(8 * S) + "px monospace";
+  ctx.fillText(label, cx, y - 11 * S);
+  let fs = 14 * S; ctx.font = "bold " + Math.round(fs) + "px 'Trebuchet MS', sans-serif";
+  while (ctx.measureText(value).width > halfW * 1.6 && fs > 8) { fs--; ctx.font = "bold " + Math.round(fs) + "px 'Trebuchet MS', sans-serif"; }
+  ctx.fillStyle = enabled ? "#eaffff" : "#9cc7da";
+  ctx.fillText(value, cx, y + 5 * S);
+  if (!enabled) return { prev: null, next: null };
+  const lx = cx - halfW, rx = cx + halfW;
+  ctx.fillStyle = "#19e6ff";
+  poly(lx, y, [[7 * S, -8 * S], [7 * S, 8 * S], [-7 * S, 0]]);
+  poly(rx, y, [[-7 * S, -8 * S], [-7 * S, 8 * S], [7 * S, 0]]);
+  const r = 18 * S;
+  return { prev: { x: lx - r, y: y - r, w: 2 * r, h: 2 * r }, next: { x: rx - r, y: y - r, w: 2 * r, h: 2 * r } };
+}
+
+// change MY lobby weapon (and tell the host, if I'm a client)
+function lobbyCycleWeapon(d) {
+  cycleWeapon(d);
+  const me = net.players.find(p => p.faction === localFaction);
+  if (me) me.weaponIdx = weaponSel;
+  if (net.role === "client" && net.hostConn && net.hostConn.open) {
+    try { net.hostConn.send({ t: "weapon", weaponIdx: weaponSel }); } catch (e) {}
+  }
+}
+// host-only: change the stage and tell everyone
+function lobbyCycleStage(d) {
+  if (net.role !== "host") return;
+  cycleLayout(d);
+  netBroadcast({ t: "stage", stage: currentLayout });
+}
+// rename me (prompt), persist, and propagate
+function lobbyRename() {
+  const n = (typeof prompt === "function") ? prompt("Your name:", playerName) : null;
+  if (n == null) return;
+  setPlayerName(n);
+  const me = net.players.find(p => p.faction === localFaction);
+  if (me) me.name = playerName;
+  if (net.role === "host") netBroadcast(rosterMsg());
+  else if (net.hostConn && net.hostConn.open) { try { net.hostConn.send({ t: "join", name: playerName, weaponIdx: weaponSel }); } catch (e) {} }
+}
+
 function drawLobby() {
   const S = ovScale(), cx = VIEW_W / 2;
   ctx.fillStyle = "rgba(3,12,22,0.55)"; ctx.fillRect(0, 0, VIEW_W, VIEW_H);
-  const pw = Math.min(VIEW_W * 0.86, 440 * S), ph = Math.min(VIEW_H * 0.92, 350 * S);
+  const pw = Math.min(VIEW_W * 0.9, 470 * S), ph = Math.min(VIEW_H * 0.96, 430 * S);
   const x0 = cx - pw / 2, y0 = VIEW_H / 2 - ph / 2;
   hudPanel(x0, y0, pw, ph);
   ctx.textAlign = "center";
@@ -3394,33 +3509,51 @@ function drawLobby() {
     lobbyUI.back = { x: cx - bw / 2, y: by, w: bw, h: 30 * S };
     drawBtn(lobbyUI.back, "BACK", "#7fb0c6", false, 12 * S);
     lobbyUI.start = lobbyUI.ready = lobbyUI.leave = null;
+    lobbyUI.name = lobbyUI.wPrev = lobbyUI.wNext = lobbyUI.sPrev = lobbyUI.sNext = null;
     if (!netAvailable()) {
       ctx.fillStyle = "#e2724f"; ctx.font = Math.round(9 * S) + "px monospace";
       ctx.fillText("Online needs a network connection (PeerJS).", cx, y0 + ph - 16 * S);
     }
   } else {
-    // room code + roster
-    ctx.fillStyle = "#7fb0c6"; ctx.font = "bold " + Math.round(9 * S) + "px monospace";
-    ctx.fillText(net.role === "host" ? "ROOM CODE — share it" : "ROOM CODE", cx, y0 + 56 * S);
-    ctx.fillStyle = "#ffd23d"; ctx.font = "bold " + Math.round(30 * S) + "px monospace";
-    ctx.fillText(net.roomCode || "…", cx, y0 + 86 * S);
-    ctx.fillStyle = net.startWarned ? "#ffb03d" : "#9cc7da"; ctx.font = (net.startWarned ? "bold " : "") + Math.round(9 * S) + "px monospace";
-    ctx.fillText(net.status || "", cx, y0 + 104 * S);
+    // ---- room code (compact) ----
+    ctx.fillStyle = "#7fb0c6"; ctx.font = "bold " + Math.round(8.5 * S) + "px monospace";
+    ctx.fillText(net.role === "host" ? "ROOM CODE — SHARE IT" : "ROOM CODE", cx, y0 + 50 * S);
+    ctx.fillStyle = "#ffd23d"; ctx.font = "bold " + Math.round(24 * S) + "px monospace";
+    ctx.fillText(net.roomCode || "…", cx, y0 + 74 * S);
+    ctx.fillStyle = net.startWarned ? "#ffb03d" : "#9cc7da"; ctx.font = (net.startWarned ? "bold " : "") + Math.round(8.5 * S) + "px monospace";
+    ctx.fillText(net.status || "", cx, y0 + 90 * S);
 
-    let ry = y0 + 128 * S;
-    const roster = net.players.length ? net.players : [{ faction: localFaction, name: "You", ready: true }];
+    // ---- your loadout: weapon (everyone) + stage (host picks) ----
+    const halfW = Math.min(pw * 0.34, 120 * S);
+    const wsel = lobbySelectorRow(cx, y0 + 118 * S, halfW, "YOUR WEAPON", WEAPONS[weaponSel].name, S, true);
+    lobbyUI.wPrev = wsel.prev; lobbyUI.wNext = wsel.next;
+    if (net.role === "host") {
+      const ss = lobbySelectorRow(cx, y0 + 152 * S, halfW, "STAGE", LAYOUT_NAMES[currentLayout], S, true);
+      lobbyUI.sPrev = ss.prev; lobbyUI.sNext = ss.next;
+    } else {
+      lobbySelectorRow(cx, y0 + 152 * S, halfW, "STAGE (HOST PICKS)", LAYOUT_NAMES[currentLayout], S, false);
+      lobbyUI.sPrev = lobbyUI.sNext = null;
+    }
+
+    // ---- roster (tap your own row to rename) ----
+    let ry = y0 + 186 * S;
+    const roster = net.players.length ? net.players : [{ faction: localFaction, name: playerName, ready: true }];
     ctx.textAlign = "left";
+    lobbyUI.name = null;
     for (const pl of roster) {
       const fc = FACTION_COLORS[pl.faction] || FACTION_COLORS[0];
+      const mine = pl.faction === localFaction;
       ctx.fillStyle = fc.ink; ctx.fillRect(x0 + pw * 0.14, ry - 9 * S, 11 * S, 11 * S);
       ctx.fillStyle = "#cfe9ff"; ctx.font = Math.round(11 * S) + "px monospace";
-      ctx.fillText(pl.name + (pl.faction === localFaction ? " (you)" : ""), x0 + pw * 0.14 + 17 * S, ry);
+      ctx.fillText(pl.name + (mine ? " (you · tap to rename)" : ""), x0 + pw * 0.14 + 17 * S, ry);
       ctx.fillStyle = pl.ready ? "#62c748" : "#7fb0c6"; ctx.textAlign = "right";
       ctx.fillText(pl.ready ? "READY" : "…", x0 + pw * 0.86, ry);
-      ctx.textAlign = "left"; ry += 19 * S;
+      ctx.textAlign = "left";
+      if (mine) lobbyUI.name = { x: x0 + pw * 0.12, y: ry - 13 * S, w: pw * 0.62, h: 18 * S };
+      ry += 19 * S;
     }
     ctx.textAlign = "center"; ctx.fillStyle = "#6f93a6"; ctx.font = Math.round(8.5 * S) + "px monospace";
-    ctx.fillText("Empty slots are filled by bots.", cx, ry + 8 * S);
+    ctx.fillText("Empty slots are filled by bots.", cx, ry + 6 * S);
 
     const bw = pw * 0.40, bh = 34 * S, gap = pw * 0.04, byy = y0 + ph - 46 * S;
     if (net.role === "host") {
@@ -3453,6 +3586,12 @@ function lobbyTap(p) {
     } else if (inR(p, lobbyUI.back)) { sfx("ui"); netReset(); game.state = "TITLE"; }
     return;
   }
+  // shared loadout controls (host + client)
+  if (inR(p, lobbyUI.name)) { lobbyRename(); return; }
+  if (inR(p, lobbyUI.wPrev)) { lobbyCycleWeapon(-1); return; }
+  if (inR(p, lobbyUI.wNext)) { lobbyCycleWeapon(1); return; }
+  if (inR(p, lobbyUI.sPrev)) { lobbyCycleStage(-1); return; }
+  if (inR(p, lobbyUI.sNext)) { lobbyCycleStage(1); return; }
   if (net.role === "host") {
     if (inR(p, lobbyUI.start)) {
       sfx("ui");
