@@ -238,6 +238,7 @@ function sfx(kind) {
     case "count":  tone(640, 0.14, "square",  0.13, 640); break;   // 3 / 2 / 1 beep
     case "go":     tone(520, 0.30, "square",  0.17, 1040); break;  // rising GO!
     case "ui":     tone(480, 0.06, "square",  0.06, 600); break;   // menu blip
+    case "pickup": tone(523, 0.18, "sine",    0.13, 1047); tone(1047, 0.12, "triangle", 0.07, 1568); break; // happy chime
   }
 }
 
@@ -808,10 +809,10 @@ function startMatch() {
   generateMap();
   countPaintable();
   player = makePlayer();
-  player.weapon = WEAPONS[weaponSel];   // equip the chosen weapon
+  player.weapon = WEAPONS[weaponSel]; player.weaponIdx = weaponSel;   // equip the chosen weapon
   enemies = [makeEnemy(0), makeEnemy(1), makeEnemy(2)];
   projectiles.length = 0; particles.length = 0; floaters.length = 0; impacts.length = 0;
-  pickups.length = 0; pickupTimer = 4; flashes.length = 0;
+  pickups.length = 0; pickupTimer = 4; flashes.length = 0; auras.length = 0;
   game.time = MATCH_TIME;
   game.shake = 0; game.flash = 0;
   game.countdown = 3.0;      // 3 · 2 · 1 · GO! intro
@@ -877,6 +878,7 @@ function updatePlayer(dt) {
       player.dead = false; player.hp = PLAYER_MAX_HP; player.ink = INK_MAX;
       player.x = PLAYER_SPAWN.x; player.y = PLAYER_SPAWN.y; player.iframe = PLAYER_IFRAMES * 1.5;
       paintTiles(player.x, player.y, 2.0, OWN_PLAYER, PLAYER_COLOR);
+      respawnFX(player, PLAYER_COLOR);   // pop back in
     }
     return;
   }
@@ -980,6 +982,7 @@ function updatePlayer(dt) {
   if (player.iframe > 0) player.iframe -= dt;
   if (player.speedBoost > 0) player.speedBoost -= dt;
   if (player.shield > 0) player.shield -= dt;
+  if (player.popIn > 0) player.popIn -= dt;
   player.squash = lerp(player.squash, 0, dt * 10);
 }
 
@@ -988,6 +991,36 @@ function rechargeInk(ent, onOwn, ownerHere, dt) {
   else if (ownerHere === OWN_NONE) ent.ink += 5 * dt;
   // enemy ink: no recharge
   ent.ink = clamp(ent.ink, 0, INK_MAX);
+}
+
+// Big juicy splat when a shark is taken out — ink explosion + shockwave rings +
+// spray, arcing droplets, white pop sparks, and rising bubbles.
+function deathBurst(x, y, color) {
+  addImpact(x, y, "#ffffff", true, color);   // white shockwave ring
+  addImpact(x, y, color, true, color);       // ink shockwave ring
+  for (let i = 0; i < 30; i++) {             // radial ink spray
+    const a = (i / 30) * TAU + rand(-0.15, 0.15), sp = rand(2.5, 7.5);
+    spawnParticle(x, y, Math.cos(a) * sp, Math.sin(a) * sp, color, rand(0.5, 1.1), rand(1.5, 3.5));
+  }
+  for (let i = 0; i < 10; i++)               // arcing droplets that fall back down
+    spawnParticle(x, y, rand(-3, 3), rand(-3, 3), shade(color, 0.15), rand(0.5, 1.0), rand(2, 3.5), 1.6);
+  for (let i = 0; i < 8; i++)                // white pop sparks
+    spawnParticle(x, y, rand(-5, 5), rand(-5, 5), "#eaffff", rand(0.22, 0.5), rand(1, 2));
+  for (let i = 0; i < 6; i++)                // rising bubbles
+    spawnParticle(x + rand(-0.5, 0.5), y, rand(-0.6, 0.6), rand(-0.4, 0.4), "#bfe9ff", rand(0.6, 1.1), rand(1, 2), 0.05);
+  game.shake = Math.min(13, game.shake + 9);
+}
+
+// Cheerful "pop back in" when a shark respawns — halo rings + sparkle puff + a
+// squash-stretch scale pop (ent.popIn drives the sprite scale in drawShark).
+function respawnFX(ent, color) {
+  addAura(ent.x, ent.y, color);
+  addAura(ent.x, ent.y, "#eaffff");
+  for (let i = 0; i < 16; i++) {
+    const a = rand(0, TAU);
+    spawnParticle(ent.x, ent.y, Math.cos(a) * rand(1, 3), Math.sin(a) * rand(1, 3) - 0.6, color, rand(0.4, 0.8), rand(1.5, 3), 0.2);
+  }
+  ent.popIn = 0.45;
 }
 
 function damagePlayer(amount, fromInk) {
@@ -1007,10 +1040,8 @@ function damagePlayer(amount, fromInk) {
   }
   if (player.hp <= 0 && !player.dead) {
     player.hp = 0; player.dead = true; player.respawn = RESPAWN_DELAY; player.diving = false;
-    // death burst
-    for (let i = 0; i < 24; i++)
-      spawnParticle(player.x, player.y, rand(-4,4), rand(-4,4), PLAYER_COLOR, rand(0.4,0.9), rand(1.5,3));
-    game.shake = 12;
+    deathBurst(player.x, player.y, PLAYER_COLOR);
+    game.flash = 0.55;            // red wipeout flash
     sfx("splat");
   }
 }
@@ -1049,10 +1080,12 @@ function updateEnemy(e, dt) {
       e.dead = false; e.hp = ENEMY_MAX_HP; e.ink = INK_MAX;
       e.x = e.spawn[0]; e.y = e.spawn[1]; e.iframe = 1.0;
       paintTiles(e.x, e.y, 2.0, OWN_ENEMY, e.color);
+      respawnFX(e, e.color);   // pop back in
     }
     return;
   }
   e.stateTimer -= dt;
+  if (e.popIn > 0) e.popIn -= dt;
   e.shootCd -= dt;
   if (e.iframe > 0) e.iframe -= dt;
   if (e.speedBoost > 0) e.speedBoost -= dt;
@@ -1268,10 +1301,8 @@ function damageEnemy(e, amount) {
     e.dead = true; e.respawn = RESPAWN_DELAY; e.diving = false;
     player.score += 100; player.kills += 1;
     player.special = Math.min(100, player.special + 22); // big SPECIAL gain on a splat
-    spawnFloater(e.x, e.y - 1.5, "SPLATTED!", "#19e6ff");
-    game.shake = Math.min(10, game.shake + 6);
-    for (let i = 0; i < 20; i++)
-      spawnParticle(e.x, e.y, rand(-5,5), rand(-5,5), e.color, rand(0.4,0.9), rand(1.5,3));
+    spawnFloater(e.x, e.y - 1.5, "SPLATTED!", PLAYER_COLOR);
+    deathBurst(e.x, e.y, e.color);
     // bonus paint where they died
     paintTiles(e.x, e.y, 2.5, OWN_PLAYER, PLAYER_COLOR);
     sfx("splat");
@@ -1378,6 +1409,25 @@ function drawFlashes() {
   }
 }
 
+/* rising halo rings — a positive "glow" used for power-ups and respawns */
+const auras = [];
+function addAura(x, y, color) { auras.push({ x, y, color, life: 0.55, max: 0.55 }); }
+function updateAuras(dt) { for (let i = auras.length - 1; i >= 0; i--) { auras[i].life -= dt; if (auras[i].life <= 0) auras.splice(i, 1); } }
+function drawAuras() {
+  for (const a of auras) {
+    const t = 1 - a.life / a.max;             // 0..1
+    const s = project(a.x, a.y);
+    const cyo = s.y - 6 - t * 18;             // ring rises as it grows
+    const rad = 6 + t * 22;
+    ctx.globalAlpha = (1 - t) * 0.85;
+    ctx.strokeStyle = a.color; ctx.lineWidth = 2.5 - t * 1.5;
+    ctx.beginPath(); ctx.ellipse(s.x, cyo, rad, rad * 0.7, 0, 0, TAU); ctx.stroke();
+    ctx.globalAlpha = (1 - t) * 0.5;
+    ctx.beginPath(); ctx.ellipse(s.x, cyo, rad * 0.6, rad * 0.42, 0, 0, TAU); ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+}
+
 /* ============================================================
    12b. POWER-UPS (floating reef pickups)
    ============================================================ */
@@ -1428,10 +1478,17 @@ function collectPickup(p, ent) {
     if (isPlayer) ent.special = 100;
     else { ent.ink = INK_MAX; ent.hp = Math.min(ENEMY_MAX_HP, ent.hp + 20); }
   }
-  spawnFloater(ent.x, ent.y - 1.2, isPlayer ? info.key : info.key, info.col);
-  for (let i = 0; i < 14; i++)
-    spawnParticle(p.x, p.y, rand(-3, 3), rand(-3, 3), info.col, rand(0.4, 0.8), rand(1.5, 3));
-  if (isPlayer) sfx("hit");
+  // positive collect VFX: a glowing halo + an upward sparkle fountain (not a splat)
+  spawnFloater(ent.x, ent.y - 1.2, info.key, info.col);
+  addAura(ent.x, ent.y, info.col);
+  for (let i = 0; i < 14; i++) {                 // sparkles drifting UP into the shark
+    const a = rand(0, TAU);
+    spawnParticle(ent.x, ent.y, Math.cos(a) * rand(0.3, 1.1), Math.sin(a) * rand(0.3, 1.1) - 1.1, info.col, rand(0.5, 0.95), rand(1.5, 3), 0.12);
+  }
+  for (let i = 0; i < 6; i++)                    // bright white twinkles
+    spawnParticle(ent.x, ent.y - 0.3, rand(-1, 1), rand(-1.6, -0.4), "#eaffff", rand(0.3, 0.6), rand(1, 2), 0.1);
+  ent.popIn = Math.max(ent.popIn || 0, 0.28);    // little celebratory squash-pop
+  if (isPlayer) sfx("pickup");
 }
 function drawPickup(p) {
   const s = project(p.x, p.y);
@@ -1583,6 +1640,7 @@ function update(dt) {
   updateParticles(dt);
   updateImpacts(dt);
   updateFlashes(dt);
+  updateAuras(dt);
   updatePickups(dt);
   updateTerritory(dt);
   updateCamera(dt);
@@ -1841,8 +1899,9 @@ function drawArena() {
     else if (item.type === "pickup") drawPickup(item.p);
   }
 
-  // 3) muzzle flashes, particles + floaters on top
+  // 3) muzzle flashes, auras, particles + floaters on top
   drawFlashes();
+  drawAuras();
   drawParticles();
   drawFloaters();
 }
@@ -2014,8 +2073,11 @@ function drawShark(ent, isPlayer) {
   const face = ent.facing >= 0 ? 1 : -1;
 
   // squash/stretch
-  const sq = 1 + (ent.squash || 0) * 0.3;
-  const st = 1 - (ent.squash || 0) * 0.3;
+  // respawn pop: scale up from small (with a slight overshoot) over ~0.45s
+  let pop = 1;
+  if (ent.popIn > 0) { const k = 1 - ent.popIn / 0.45; pop = clamp(0.25 + k * 0.95, 0.25, 1.12); }
+  const sq = (1 + (ent.squash || 0) * 0.3) * pop;
+  const st = (1 - (ent.squash || 0) * 0.3) * pop;
 
   // shadow
   ctx.fillStyle = "rgba(0,0,0,0.25)";
@@ -2057,7 +2119,7 @@ function drawShark(ent, isPlayer) {
   ctx.restore();
 
   // shell-and-coral sea-ink blaster, held low in the front hand, aimed in world space
-  drawBlaster(px, py - 9 + bob, ent.aim, ink, dark);
+  drawBlaster(px, py - 9 + bob, ent.aim, ink, dark, isPlayer ? (player.weaponIdx || 0) : 0);
 
   // floating identity tag above the head
   const ty = py - 48 + Math.sin(bgT * 4 + ent.x * 1.7) * 1.2;
@@ -2150,25 +2212,61 @@ function drawChibiBody(col, dark, ink, isPlayer, phase, moving) {
 }
 
 // Blaster made of coral/shell parts, drawn pointing along aim angle (in world).
-function drawBlaster(px, py, aimWorld, ink, dark) {
-  // convert world-aim direction to screen direction for the muzzle
+// Draw the held weapon, rotated toward the aim direction. `widx` selects the
+// weapon silhouette (defaults to the Tide Blaster); enemies use 0.
+function drawBlaster(px, py, aimWorld, ink, dark, widx) {
   const dir = worldToScreen(Math.cos(aimWorld), Math.sin(aimWorld));
   const a = Math.atan2(dir.y, dir.x);
   ctx.save();
   ctx.translate(px, py - 2);
   ctx.rotate(a);
-  // shell grip
-  ctx.fillStyle = "#e9c6a0";
-  ctx.fillRect(0, -3, 8, 6);
-  // barrel
-  ctx.fillStyle = dark;
-  ctx.fillRect(6, -3, 9, 6);
-  ctx.fillStyle = "#f0e6d2";
-  ctx.fillRect(6, -3, 9, 2);
-  // glowing muzzle
-  ctx.fillStyle = shade(ink, 0.4);
-  ctx.fillRect(14, -3, 3, 6);
+  drawWeaponShape(widx || 0, ink, dark);
   ctx.restore();
+}
+
+// Each weapon has a distinct procedural silhouette, drawn in a local frame where
+// +x is "forward" (the muzzle). Shared by the held weapon and the select icon.
+function drawWeaponShape(idx, ink, dark) {
+  const shell = "#e3c79a", shellLt = "#f4ead2", coral = "#d98f86", coralDk = "#b06a62";
+  const glow = shade(ink, 0.4);
+  if (idx === 1) {
+    // ---- REEF SPRAY: stubby sprayer, top ink tank, wide multi-port fan nozzle
+    ctx.fillStyle = "#b78a58"; ctx.fillRect(-1, 0, 4, 8);          // grip
+    ctx.fillStyle = dark; ctx.fillRect(2, -5, 8, 11);              // body box
+    ctx.fillStyle = shade(dark, 0.18); ctx.fillRect(2, -5, 8, 2);
+    ctx.fillStyle = shade(ink, -0.05); ctx.beginPath(); ctx.arc(6, -7, 3.4, 0, TAU); ctx.fill(); // tank
+    ctx.fillStyle = glow; ctx.beginPath(); ctx.arc(5, -8, 1.2, 0, TAU); ctx.fill();
+    ctx.fillStyle = shell; poly(10, 0, [[0, -6], [8, -8], [8, 8], [0, 6]]);  // flared nozzle
+    ctx.fillStyle = shellLt; poly(10, 0, [[0, -6], [8, -8], [8, -6], [0, -4]]);
+    ctx.fillStyle = glow; ctx.fillRect(16, -6, 2, 2); ctx.fillRect(16, -1, 2, 2); ctx.fillRect(16, 4, 2, 2); // ports
+  } else if (idx === 2) {
+    // ---- DEEP CANNON: big bulbous conch barrel with a huge glowing muzzle
+    ctx.fillStyle = "#9c6e44"; ctx.fillRect(-2, -1, 5, 9);        // chunky grip
+    ctx.fillStyle = dark; poly(3, 0, [[0, -6], [14, -9], [18, -9], [18, 9], [14, 9], [0, 6]]); // body
+    ctx.fillStyle = shade(dark, 0.2); poly(3, 0, [[0, -6], [14, -9], [14, -5], [0, -2]]);       // top sheen
+    ctx.fillStyle = coral; ctx.fillRect(6, -8, 2, 16); ctx.fillStyle = coralDk; ctx.fillRect(10, -9, 2, 18); // coral ridges
+    ctx.fillStyle = "#06202b"; ctx.fillRect(17, -8, 4, 16);       // muzzle bore
+    ctx.fillStyle = glow; ctx.fillRect(18, -6, 3, 12);
+    ctx.fillStyle = ink; ctx.fillRect(19, -3, 2, 6);
+  } else if (idx === 3) {
+    // ---- TRIAD BURST: triple-barrel trident launcher
+    ctx.fillStyle = "#b78a58"; ctx.fillRect(-1, -1, 5, 8);        // grip
+    ctx.fillStyle = dark; ctx.fillRect(2, -8, 7, 16);             // breech block
+    ctx.fillStyle = shade(dark, 0.18); ctx.fillRect(2, -8, 7, 2);
+    ctx.fillStyle = coral; ctx.fillRect(2, -1, 7, 2);
+    ctx.fillStyle = shell; ctx.fillRect(9, -8, 9, 4); ctx.fillRect(9, -2, 9, 4); ctx.fillRect(9, 4, 9, 4); // 3 barrels
+    ctx.fillStyle = shellLt; ctx.fillRect(9, -8, 9, 1); ctx.fillRect(9, -2, 9, 1); ctx.fillRect(9, 4, 9, 1);
+    ctx.fillStyle = glow; ctx.fillRect(16, -7, 2, 2); ctx.fillRect(16, -1, 2, 2); ctx.fillRect(16, 5, 2, 2); // muzzles
+  } else {
+    // ---- TIDE BLASTER: sleek balanced coral pistol
+    ctx.fillStyle = "#b78a58"; ctx.fillRect(-1, 0, 4, 7);         // grip
+    ctx.fillStyle = shell; ctx.fillRect(0, -3, 8, 6);             // body
+    ctx.fillStyle = coral; ctx.fillRect(2, -3, 2, 6);            // coral band
+    ctx.fillStyle = dark; ctx.fillRect(6, -3, 9, 6);            // barrel
+    ctx.fillStyle = shellLt; ctx.fillRect(6, -3, 9, 2);
+    ctx.fillStyle = glow; ctx.fillRect(14, -3, 3, 6);           // muzzle glow
+    ctx.fillStyle = ink; ctx.fillRect(16, -2, 1, 4);
+  }
 }
 
 function drawProjectile(p) {
@@ -2309,15 +2407,18 @@ function drawHUD() {
   ctx.fillRect(Math.round(pb.x - 4 * UI), Math.round(pb.y - pbh / 2), pbw, pbh);
   ctx.fillRect(Math.round(pb.x + 4 * UI - pbw), Math.round(pb.y - pbh / 2), pbw, pbh);
 
-  // ===== dead overlay =====
+  // ===== dead overlay (fades in so the death VFX is visible first) =====
   if (player.dead) {
     const S = ovScale();
-    ctx.fillStyle = "rgba(0,0,0,0.4)"; ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+    const elapsed = RESPAWN_DELAY - player.respawn;
+    const fade = clamp(elapsed / 0.6, 0, 1);   // ramp over the first 0.6s
+    ctx.fillStyle = "rgba(0,0,0," + (0.42 * fade) + ")"; ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+    ctx.globalAlpha = fade;
     ctx.textAlign = "center"; ctx.fillStyle = "#ff8a8a"; ctx.font = "bold " + Math.round(26 * S) + "px 'Trebuchet MS'";
     ctx.fillText("WIPED OUT!", VIEW_W / 2, VIEW_H / 2 - 6 * S);
     ctx.fillStyle = "#cfe9ff"; ctx.font = "bold " + Math.round(13 * S) + "px monospace";
     ctx.fillText("respawning in " + player.respawn.toFixed(1) + "s", VIEW_W / 2, VIEW_H / 2 + 18 * S);
-    ctx.textAlign = "left";
+    ctx.globalAlpha = 1; ctx.textAlign = "left";
   }
 }
 
@@ -2523,15 +2624,10 @@ function drawTitleShark(cx, cy, S) {
 
 /* ---------- WEAPON SELECT (character left, weapon carousel right) ---------- */
 function drawWeaponIcon(x, y, s, idx) {
-  ctx.save(); ctx.translate(x, y); ctx.scale(s, s);
-  const ink = PLAYER_COLOR, dark = PLAYER_BODY_DARK;
-  ctx.fillStyle = "#e3c79a"; ctx.fillRect(-11, -3, 9, 8);          // shell grip
-  const len = idx === 2 ? 22 : idx === 1 ? 12 : idx === 3 ? 10 : 16; // barrel length per weapon
-  ctx.fillStyle = dark; ctx.fillRect(-2, -4, len, 8);
-  ctx.fillStyle = "#f0e6d2"; ctx.fillRect(-2, -4, len, 2);
-  ctx.fillStyle = shade(ink, 0.35); ctx.fillRect(len - 3, -4, 4, 8); // muzzle glow
-  if (idx === 3) { ctx.fillStyle = ink; ctx.fillRect(len + 1, -7, 2, 2); ctx.fillRect(len + 1, -1, 2, 2); ctx.fillRect(len + 1, 5, 2, 2); }
-  if (idx === 2) { ctx.fillStyle = "#d98f86"; ctx.fillRect(-4, -6, 4, 12); } // cannon coral chunk
+  ctx.save();
+  ctx.translate(x - 9 * s, y);   // roughly centre the muzzle-forward shape
+  ctx.scale(s, s);
+  drawWeaponShape(idx, PLAYER_COLOR, PLAYER_BODY_DARK);
   ctx.restore();
 }
 function drawWeaponSelect() {
@@ -2551,7 +2647,7 @@ function drawWeaponSelect() {
   ctx.scale(cScale, cScale);
   drawChibiBody(PLAYER_BODY, PLAYER_BODY_DARK, PLAYER_COLOR, true, bgT * 2, false);
   ctx.restore();
-  drawBlaster(lpX + lpW / 2 + 6 * cScale, lpY + lpH * 0.64 - 9 * cScale, -0.35, PLAYER_COLOR, PLAYER_BODY_DARK);
+  drawBlaster(lpX + lpW / 2 + 6 * cScale, lpY + lpH * 0.64 - 9 * cScale, -0.35, PLAYER_COLOR, PLAYER_BODY_DARK, weaponSel);
   ctx.fillStyle = "#bfe9ff"; ctx.font = "bold " + Math.round(10 * S) + "px monospace"; ctx.textAlign = "center";
   ctx.fillText("YOUR WARRIOR", lpX + lpW / 2, lpY + lpH - 10 * S);
 
