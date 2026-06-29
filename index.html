@@ -2859,6 +2859,7 @@ function drawCredits() {
 
   const lines = [
     ["", "An original isometric shark ink-battle arena."],
+    ["CREATED BY", "Saiss"],
     ["DESIGN & CODE", "Built from scratch in vanilla JavaScript."],
     ["ART", "Procedural pixel-art — every shark, tile & VFX"],
     ["", "drawn live on an HTML5 Canvas."],
@@ -2869,9 +2870,11 @@ function drawCredits() {
   let yy = y0 + 86 * S; const lh = Math.min(26 * S, (ph - 150 * S) / lines.length);
   for (const row of lines) {
     if (row[0]) {
+      const hi = row[0] === "CREATED BY";   // highlight the author line
       ctx.textAlign = "left"; ctx.fillStyle = "#7fb0c6"; ctx.font = "bold " + Math.round(9 * S) + "px monospace";
       ctx.fillText(row[0], x0 + pw * 0.08, yy);
-      ctx.fillStyle = "#cfe9ff"; ctx.font = Math.round(9.5 * S) + "px monospace";
+      ctx.fillStyle = hi ? PLAYER_COLOR : "#cfe9ff";
+      ctx.font = (hi ? "bold " : "") + Math.round((hi ? 12 : 9.5) * S) + "px monospace";
       ctx.fillText(row[1], x0 + pw * 0.30, yy);
     } else {
       ctx.textAlign = "center"; ctx.fillStyle = "#9cc7da"; ctx.font = Math.round(9.5 * S) + "px monospace";
