@@ -93,7 +93,7 @@ const SHOT_COST = 8;
 const SPLASH_RADIUS = 2.2;
 
 // Match
-const MATCH_TIME = 180;     // seconds (3 minutes)
+const MATCH_TIME = 120;     // seconds (2 minutes) — snappy arena match
 
 // Combat
 const PLAYER_MAX_HP = 100;
@@ -207,7 +207,7 @@ function initAudio() {
   }
   if (audioCtx && audioCtx.state === "suspended") audioCtx.resume();
 }
-// short tone with optional pitch slide
+// short tone with optional pitch slide (volume scaled by the SFX setting)
 function tone(freq, dur, type, vol, slideTo) {
   if (!audioCtx) return;
   const t = audioCtx.currentTime;
@@ -215,7 +215,7 @@ function tone(freq, dur, type, vol, slideTo) {
   o.type = type || "square";
   o.frequency.setValueAtTime(freq, t);
   if (slideTo) o.frequency.exponentialRampToValueAtTime(Math.max(20, slideTo), t + dur);
-  g.gain.setValueAtTime(vol || 0.12, t);
+  g.gain.setValueAtTime((vol || 0.12) * settings.sfxVol, t);
   g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
   o.connect(g); g.connect(audioCtx.destination);
   o.start(t); o.stop(t + dur + 0.02);
@@ -230,12 +230,12 @@ function noiseBurst(dur, vol, freq) {
   for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, 2);
   const n = audioCtx.createBufferSource(); n.buffer = buf;
   const f = audioCtx.createBiquadFilter(); f.type = "bandpass"; f.frequency.value = freq || 1100; f.Q.value = 0.7;
-  const g = audioCtx.createGain(); g.gain.value = vol || 0.2;
+  const g = audioCtx.createGain(); g.gain.value = (vol || 0.2) * settings.sfxVol;
   n.connect(f); f.connect(g); g.connect(audioCtx.destination);
   n.start(t);
 }
 function sfx(kind) {
-  if (!audioCtx || !settings.sfx) return;
+  if (!audioCtx || settings.sfxVol <= 0) return;
   switch (kind) {
     case "shoot":  tone(540, 0.08, "square",  0.07, 280); break;
     case "eshoot": tone(360, 0.08, "sawtooth",0.04, 200); break;
@@ -251,11 +251,17 @@ function sfx(kind) {
   }
 }
 
-/* ---- SETTINGS (persisted) ---- */
-const settings = { music: true, sfx: true };
+/* ---- SETTINGS (persisted): music/SFX volumes 0..1 ---- */
+const settings = { musicVol: 0.6, sfxVol: 0.8 };
 try {
   const sv = JSON.parse(localStorage.getItem("reefRumble.settings"));
-  if (sv) { settings.music = sv.music !== false; settings.sfx = sv.sfx !== false; }
+  if (sv) {
+    // accept new volume keys, and migrate the old on/off booleans
+    if (typeof sv.musicVol === "number") settings.musicVol = clamp(sv.musicVol, 0, 1);
+    else if (sv.music === false) settings.musicVol = 0;
+    if (typeof sv.sfxVol === "number") settings.sfxVol = clamp(sv.sfxVol, 0, 1);
+    else if (sv.sfx === false) settings.sfxVol = 0;
+  }
 } catch (e) {}
 function saveSettings() { try { localStorage.setItem("reefRumble.settings", JSON.stringify(settings)); } catch (e) {} }
 
@@ -279,8 +285,9 @@ function playMusicStep(step, t, spb) {
   const s2 = M_ARP[step % M_ARP.length]; mnote(root * Math.pow(2, s2 / 12), t, spb * 0.9, "sine", 0.16);
 }
 function updateMusic() {
-  if (!audioCtx || !settings.music) return;
-  if (!musicGain) { musicGain = audioCtx.createGain(); musicGain.gain.value = 0.10; musicGain.connect(audioCtx.destination); musicNextTime = audioCtx.currentTime + 0.1; musicStep = 0; }
+  if (!audioCtx || settings.musicVol <= 0) return;
+  if (!musicGain) { musicGain = audioCtx.createGain(); musicGain.connect(audioCtx.destination); musicNextTime = audioCtx.currentTime + 0.1; musicStep = 0; }
+  musicGain.gain.value = 0.16 * settings.musicVol;   // live volume
   if (musicNextTime < audioCtx.currentTime) musicNextTime = audioCtx.currentTime + 0.05; // resync after pause/off
   const spb = 60 / MUSIC_BPM / 2; // eighth-note step
   while (musicNextTime < audioCtx.currentTime + 0.25) {
@@ -307,7 +314,14 @@ const settingsUI  = { music: null, sfx: null, back: null };
 const howtoUI     = { back: null };
 const pauseUI     = { resume: null, menu: null, settings: null };
 let settingsFrom = "TITLE";                 // where the SETTINGS screen returns to
+let settingsDrag = null, settingsDragId = -1;  // which volume slider is being dragged
+let showFirstTips = false;                      // control hints on the first match
 function inR(p, r) { return r && p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h; }
+function setSliderFromX(which, x) {
+  const r = settingsUI[which]; if (!r) return;
+  const v = clamp((x - r.x) / r.w, 0, 1);
+  settings[which === "music" ? "musicVol" : "sfxVol"] = v;
+}
 
 // PWA update toast state (set by the service-worker logic near boot)
 let updateReady = false, waitingWorker = null;
@@ -339,7 +353,7 @@ function toInternal(clientX, clientY) {
   const r = canvas.getBoundingClientRect();
   return { x: (clientX - r.left) / r.width * VIEW_W, y: (clientY - r.top) / r.height * VIEW_H };
 }
-canvas.addEventListener("mousemove", e => { const p = toInternal(e.clientX, e.clientY); mouseScreenX = p.x; mouseScreenY = p.y; usingMouse = true; });
+canvas.addEventListener("mousemove", e => { const p = toInternal(e.clientX, e.clientY); mouseScreenX = p.x; mouseScreenY = p.y; usingMouse = true; if (settingsDrag) setSliderFromX(settingsDrag, p.x); });
 canvas.addEventListener("mousedown", e => {
   if (e.button !== 0) return;
   initAudio();
@@ -354,7 +368,7 @@ canvas.addEventListener("mousedown", e => {
   }
   menuTap(p);          // all non-gameplay screens
 });
-window.addEventListener("mouseup", e => { if (e.button === 0) mouseDown = false; });
+window.addEventListener("mouseup", e => { if (e.button === 0) { mouseDown = false; if (settingsDrag) { settingsDrag = null; saveSettings(); } } });
 canvas.addEventListener("contextmenu", e => e.preventDefault());
 
 // Unified tap/click handler for every non-gameplay screen
@@ -373,8 +387,8 @@ function menuTap(p) {
       else if (inR(p, weaponUI.back)) { sfx("ui"); game.state = "TITLE"; }
       return;
     case "SETTINGS":
-      if (inR(p, settingsUI.music)) { settings.music = !settings.music; saveSettings(); if (settings.music && audioCtx) musicNextTime = audioCtx.currentTime + 0.05; sfx("ui"); }
-      else if (inR(p, settingsUI.sfx)) { settings.sfx = !settings.sfx; saveSettings(); sfx("ui"); }
+      if (inR(p, settingsUI.music)) { settingsDrag = "music"; setSliderFromX("music", p.x); sfx("ui"); }
+      else if (inR(p, settingsUI.sfx)) { settingsDrag = "sfx"; setSliderFromX("sfx", p.x); sfx("ui"); }
       else if (inR(p, settingsUI.back)) { sfx("ui"); game.state = settingsFrom; }
       return;
     case "HOWTO":
@@ -463,9 +477,14 @@ function onTouchStart(e) {
   for (const t of e.changedTouches) {
     const p = toInternal(t.clientX, t.clientY);
     if (updateReady && inR(p, toastRect)) { applyUpdate(); return; }
-    // any non-gameplay screen routes through menuTap (plus weapon-swipe tracking)
+    // any non-gameplay screen routes through menuTap (plus weapon-swipe & slider drag)
     if (game.state !== "PLAYING") {
       if (game.state === "WEAPONSELECT") wsSwipe = { id: t.identifier, x: p.x };
+      if (game.state === "SETTINGS" && (inR(p, settingsUI.music) || inR(p, settingsUI.sfx))) {
+        settingsDrag = inR(p, settingsUI.music) ? "music" : "sfx";
+        settingsDragId = t.identifier; setSliderFromX(settingsDrag, p.x); sfx("ui");
+        return;
+      }
       menuTap(p);
       return;
     }
@@ -492,6 +511,7 @@ function onTouchMove(e) {
     const p = toInternal(t.clientX, t.clientY);
     if (t.identifier === moveStick.id) updateStick(moveStick, p);
     else if (t.identifier === btnShoot.id) setFireDrag(p);
+    else if (settingsDrag && t.identifier === settingsDragId) setSliderFromX(settingsDrag, p.x);
   }
 }
 function updateStick(s, p) {
@@ -512,6 +532,7 @@ function onTouchEnd(e) {
       }
       wsSwipe = null;
     }
+    if (settingsDrag && t.identifier === settingsDragId) { settingsDrag = null; settingsDragId = -1; saveSettings(); }
     if (t.identifier === moveStick.id) { moveStick.active = false; moveStick.id = -1; moveStick.dx = 0; moveStick.dy = 0; }
     if (t.identifier === btnShoot.id)  { btnShoot.id = -1; btnShoot.pressed = false; btnShoot.dx = 0; btnShoot.dy = 0; }
     if (t.identifier === btnDive.id)   { btnDive.id = -1; btnDive.pressed = false; }
@@ -853,6 +874,9 @@ function startMatch() {
   game.shake = 0; game.flash = 0;
   game.countdown = 3.0;      // 3 · 2 · 1 · GO! intro
   game.state = "PLAYING";
+  // show control tips during the very first match only
+  try { showFirstTips = !localStorage.getItem("reefRumble.played"); localStorage.setItem("reefRumble.played", "1"); }
+  catch (e) { showFirstTips = false; }
   sfx("count");              // beep for the opening "3"
   // snap camera to player
   const sp = worldToScreen(player.x, player.y);
@@ -2953,31 +2977,33 @@ function drawWeaponSelect() {
   ctx.textAlign = "left";
 }
 
-/* ---------- SETTINGS ---------- */
-function drawToggleRow(r, label, on, S) {
-  ctx.fillStyle = "rgba(8,30,46,0.7)"; rrect(r.x, r.y, r.w, r.h);
-  ctx.strokeStyle = "rgba(40,196,228,0.5)"; ctx.lineWidth = Math.max(1, S);
+/* ---------- SETTINGS (volume sliders) ---------- */
+function drawSliderRow(r, label, value, S) {
+  ctx.textBaseline = "alphabetic";
+  ctx.textAlign = "left"; ctx.fillStyle = "#cfe9ff"; ctx.font = "bold " + Math.round(11 * S) + "px monospace";
+  ctx.fillText(label, r.x, r.y - 7 * S);
+  ctx.textAlign = "right"; ctx.fillStyle = value <= 0 ? "#ff8a8a" : "#7fb0c6"; ctx.font = "bold " + Math.round(10 * S) + "px monospace";
+  ctx.fillText(value <= 0 ? "OFF" : Math.round(value * 100) + "%", r.x + r.w, r.y - 7 * S);
+  // track + fill
+  ctx.fillStyle = "#06202e"; rrect(r.x, r.y, r.w, r.h);
+  ctx.fillStyle = value <= 0 ? "#3c5560" : PLAYER_COLOR; rrect(r.x, r.y, r.w * value, r.h);
+  ctx.strokeStyle = "rgba(40,196,228,0.5)"; ctx.lineWidth = 1;
   ctx.strokeRect(Math.round(r.x) + 0.5, Math.round(r.y) + 0.5, Math.round(r.w), Math.round(r.h));
-  ctx.textBaseline = "middle"; ctx.textAlign = "left";
-  ctx.fillStyle = "#cfe9ff"; ctx.font = "bold " + Math.round(12 * S) + "px monospace";
-  ctx.fillText(label, r.x + 12 * S, r.y + r.h / 2);
-  const pw = 46 * S, ph = 20 * S, px = r.x + r.w - pw - 12 * S, py = r.y + (r.h - ph) / 2;
-  ctx.fillStyle = on ? "#1f6e42" : "#5a2c34"; rrect(px, py, pw, ph);
-  const knob = ph - 4;
-  ctx.fillStyle = on ? "#3dff8a" : "#ff8a8a"; rrect(on ? px + pw - knob - 2 : px + 2, py + 2, knob, knob);
-  ctx.fillStyle = "#eaffff"; ctx.font = "bold " + Math.round(8 * S) + "px monospace"; ctx.textAlign = "center";
-  ctx.fillText(on ? "ON" : "OFF", on ? px + (pw - knob) / 2 : px + pw - (pw - knob) / 2, py + ph / 2);
-  ctx.textBaseline = "alphabetic"; ctx.textAlign = "left";
+  // knob
+  const kx = r.x + r.w * value, ky = r.y + r.h / 2, kr = r.h * 1.1;
+  ctx.fillStyle = "#eaffff"; ctx.beginPath(); ctx.arc(kx, ky, kr, 0, TAU); ctx.fill();
+  ctx.fillStyle = value <= 0 ? "#3c5560" : PLAYER_COLOR; ctx.beginPath(); ctx.arc(kx, ky, kr * 0.55, 0, TAU); ctx.fill();
+  ctx.textAlign = "left";
 }
 function drawSettings() {
   const S = ovScale(), cx = VIEW_W / 2, cy = VIEW_H / 2;
-  const pw = Math.min(VIEW_W * 0.82, 340 * S), ph = Math.min(VIEW_H * 0.8, 250 * S);
+  const pw = Math.min(VIEW_W * 0.82, 360 * S), ph = Math.min(VIEW_H * 0.82, 240 * S);
   hudPanel(cx - pw / 2, cy - ph / 2, pw, ph);
   ctx.textAlign = "center"; ctx.fillStyle = PLAYER_COLOR; ctx.font = "bold " + Math.round(26 * S) + "px 'Trebuchet MS'";
-  ctx.fillText("SETTINGS", cx, cy - ph / 2 + 38 * S);
-  const rw = pw * 0.78, rx = cx - rw / 2, rh = 34 * S; let ry = cy - ph * 0.10;
-  settingsUI.music = { x: rx, y: ry, w: rw, h: rh }; drawToggleRow(settingsUI.music, "MUSIC", settings.music, S); ry += rh + 14 * S;
-  settingsUI.sfx = { x: rx, y: ry, w: rw, h: rh }; drawToggleRow(settingsUI.sfx, "SOUND FX", settings.sfx, S);
+  ctx.fillText("SETTINGS", cx, cy - ph / 2 + 36 * S);
+  const rw = pw * 0.74, rx = cx - rw / 2, rh = 11 * S; let ry = cy - ph * 0.04;
+  settingsUI.music = { x: rx, y: ry, w: rw, h: rh }; drawSliderRow(settingsUI.music, "MUSIC", settings.musicVol, S); ry += rh + 38 * S;
+  settingsUI.sfx = { x: rx, y: ry, w: rw, h: rh }; drawSliderRow(settingsUI.sfx, "SOUND FX", settings.sfxVol, S);
   settingsUI.back = { x: cx - 52 * S, y: cy + ph / 2 - 40 * S, w: 104 * S, h: 28 * S };
   drawBtn(settingsUI.back, "BACK", "#7fb0c6", false, 12 * S);
   ctx.textAlign = "left";
@@ -3052,6 +3078,22 @@ function drawCountdown() {
   ctx.fillStyle = col; ctx.fillText(label, cx, cy);
   ctx.globalAlpha = 1; ctx.textBaseline = "alphabetic"; ctx.textAlign = "left";
   ctx.restore();
+
+  // first-match control tips
+  if (showFirstTips) {
+    const tip = isTouch
+      ? "Left stick: MOVE   ·   right FIRE pad: AIM + SHOOT (drag to aim)   ·   DIVE on your own ink   ·   ULTI when charged"
+      : "WASD: move   ·   Mouse: aim   ·   Click/Space: shoot   ·   Shift: dive on your ink   ·   Q: ulti";
+    ctx.textAlign = "center";
+    let fs = 11 * S; ctx.font = Math.round(fs) + "px monospace";
+    while (ctx.measureText(tip).width > VIEW_W * 0.92 && fs > 7) { fs--; ctx.font = Math.round(fs) + "px monospace"; }
+    const ty = VIEW_H * 0.66;
+    ctx.fillStyle = "rgba(6,20,34,0.8)";
+    const tw = ctx.measureText(tip).width + 18 * S;
+    rrect(cx - tw / 2, ty - 12 * S, tw, 20 * S);
+    ctx.fillStyle = "#cfe9ff"; ctx.fillText(tip, cx, ty + 2 * S);
+    ctx.textAlign = "left";
+  }
 }
 
 function drawPause() {
@@ -3091,41 +3133,59 @@ function drawPause() {
 
 function drawResult(win) {
   const S = ovScale(), cx = VIEW_W / 2;
-  ctx.fillStyle = "rgba(4,14,24,0.88)"; ctx.fillRect(0, 0, VIEW_W, VIEW_H);
-  // card
-  const pw = Math.min(VIEW_W * 0.9, 360 * S), ph = Math.min(VIEW_H * 0.9, 360 * S);
+  ctx.fillStyle = "rgba(4,14,24,0.9)"; ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+  const pw = Math.min(VIEW_W * 0.9, 380 * S), ph = Math.min(VIEW_H * 0.94, 404 * S);
   const px0 = cx - pw / 2, py0 = VIEW_H / 2 - ph / 2;
   hudPanel(px0, py0, pw, ph);
   ctx.textAlign = "center";
   const r = game.result || { total: 0, killScore: 0, coverScore: 0 };
-  ctx.font = "bold " + Math.round(38 * S) + "px 'Trebuchet MS'";
-  ctx.fillStyle = win ? "#3dff8a" : "#ff6b6b";
-  ctx.fillText(win ? "VICTORY!" : "DEFEAT", cx, py0 + ph * 0.16);
-  ctx.font = "bold " + Math.round(12 * S) + "px monospace"; ctx.fillStyle = "#cfe9ff";
-  ctx.fillText(win ? "You painted the reef cyan!" : "The rival gangs out-inked you...", cx, py0 + ph * 0.16 + 22 * S);
 
-  // territory result bar
-  const bw = pw * 0.78, bx = cx - bw / 2, by = py0 + ph * 0.34, bh = 18 * S;
-  ctx.fillStyle = "#06202e"; ctx.fillRect(Math.round(bx - 2), Math.round(by - 2), Math.round(bw + 4), Math.round(bh + 4));
-  ctx.fillStyle = PLAYER_COLOR; ctx.fillRect(Math.round(bx), Math.round(by), Math.round(bw * game.pct.player / 100), Math.round(bh));
-  ctx.fillStyle = ENEMY_COLORS[0].ink; ctx.fillRect(Math.round(bx + bw - bw * game.pct.enemy / 100), Math.round(by), Math.round(bw * game.pct.enemy / 100), Math.round(bh));
-  ctx.fillStyle = "#fff"; ctx.font = "bold " + Math.round(10 * S) + "px monospace";
-  ctx.fillText("YOU " + Math.round(game.pct.player) + "%   vs   RIVALS " + Math.round(game.pct.enemy) + "%", cx, by + bh + 13 * S);
+  // build the four-faction standings
+  const facs = [{ n: "YOU", p: game.pct.player, c: PLAYER_COLOR, me: true }];
+  for (let i = 0; i < 3; i++) facs.push({ n: "Rival " + (i + 1), p: (game.pct.gangs && game.pct.gangs[i]) || 0, c: ENEMY_COLORS[i].ink });
+  const ranked = facs.slice().sort((a, b) => b.p - a.p);
+  const rank = ranked.indexOf(facs[0]) + 1;
+  const ord = ["1st", "2nd", "3rd", "4th"];
+
+  // title + placing
+  ctx.font = "bold " + Math.round(34 * S) + "px 'Trebuchet MS'";
+  ctx.fillStyle = win ? "#3dff8a" : "#ff6b6b";
+  ctx.fillText(win ? "VICTORY!" : "DEFEAT", cx, py0 + 34 * S);
+  ctx.font = "bold " + Math.round(11 * S) + "px monospace"; ctx.fillStyle = "#cfe9ff";
+  ctx.fillText(win ? ord[rank - 1] + " PLACE — you ruled the reef!" : ord[rank - 1] + " of 4 — out-inked this time", cx, py0 + 54 * S);
+
+  // four-faction segmented bar
+  const bx = px0 + pw * 0.1, by = py0 + 66 * S, bw = pw * 0.8, bh = 14 * S;
+  ctx.fillStyle = "#06202e"; rrect(bx, by, bw, bh);
+  let xo = bx;
+  for (const f of facs) { const w = bw * f.p / 100; if (w > 0.5) { ctx.fillStyle = f.c; rrect(xo, by, w, bh); } xo += w; }
+  ctx.strokeStyle = "rgba(40,196,228,0.45)"; ctx.lineWidth = 1; ctx.strokeRect(Math.round(bx) + 0.5, Math.round(by) + 0.5, Math.round(bw), Math.round(bh));
+
+  // ranked standings list
+  const yy = py0 + 96 * S, rh = Math.min(26 * S, (ph * 0.42) / 4);
+  ctx.font = "bold " + Math.round(12 * S) + "px monospace"; ctx.textBaseline = "middle";
+  for (let i = 0; i < ranked.length; i++) {
+    const f = ranked[i], rowY = yy + i * rh + rh / 2;
+    if (f.me) { ctx.fillStyle = "rgba(44,202,218,0.12)"; rrect(bx - 4 * S, rowY - rh / 2, bw + 8 * S, rh); }
+    ctx.textAlign = "left"; ctx.fillStyle = f.me ? "#eaffff" : "#8fb4c6"; ctx.fillText((i + 1) + ".", bx, rowY);
+    ctx.fillStyle = f.c; rrect(bx + 20 * S, rowY - 5 * S, 10 * S, 10 * S);
+    ctx.fillStyle = f.me ? "#eaffff" : "#cfe9ff"; ctx.fillText(f.n, bx + 36 * S, rowY);
+    ctx.textAlign = "right"; ctx.fillStyle = f.c; ctx.fillText(Math.round(f.p) + "%", bx + bw, rowY);
+  }
+  ctx.textBaseline = "alphabetic";
 
   // score breakdown
-  ctx.fillStyle = "#9cc7da"; ctx.font = Math.round(12 * S) + "px monospace";
-  let yy = py0 + ph * 0.60;
-  ctx.fillText("Coverage bonus:  " + r.coverScore, cx, yy);
-  ctx.fillText("Splats x" + player.kills + ":  " + r.killScore, cx, yy + 18 * S);
+  const sy = yy + 4 * rh + 22 * S;
+  ctx.textAlign = "center"; ctx.fillStyle = "#9cc7da"; ctx.font = Math.round(11 * S) + "px monospace";
+  ctx.fillText("Coverage " + r.coverScore + "    ·    Splats x" + player.kills + "  " + r.killScore, cx, sy);
   ctx.fillStyle = PLAYER_COLOR; ctx.font = "bold " + Math.round(18 * S) + "px monospace";
-  ctx.fillText("TOTAL  " + r.total, cx, yy + 44 * S);
+  ctx.fillText("TOTAL  " + r.total, cx, sy + 24 * S);
 
-  const pulse = 0.5 + 0.5 * Math.sin(bgT * 6);
-  ctx.globalAlpha = 0.5 + pulse * 0.5;
-  ctx.fillStyle = "#fff"; ctx.font = "bold " + Math.round(13 * S) + "px monospace";
-  ctx.fillText(isTouch ? "TAP for title" : "CLICK or ENTER for title", cx, py0 + ph * 0.93);
-  ctx.globalAlpha = 1;
-  ctx.textAlign = "left";
+  // prompt
+  ctx.globalAlpha = 0.5 + 0.5 * Math.sin(bgT * 6);
+  ctx.fillStyle = "#fff"; ctx.font = "bold " + Math.round(12 * S) + "px monospace";
+  ctx.fillText(isTouch ? "TAP for title" : "CLICK or ENTER for title", cx, py0 + ph - 10 * S);
+  ctx.globalAlpha = 1; ctx.textAlign = "left";
 }
 
 /* ============================================================
