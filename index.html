@@ -385,6 +385,7 @@ const weaponUI    = { prev: null, next: null, start: null, back: null };
 const settingsUI  = { music: null, sfx: null, colorblind: null, perf: null, back: null };
 const howtoUI     = { back: null };
 const pauseUI     = { resume: null, menu: null, settings: null };
+const resultUI    = { rematch: null, leave: null };   // (MP) result-screen buttons
 let settingsFrom = "TITLE";                 // where the SETTINGS screen returns to
 let settingsDrag = null, settingsDragId = -1;  // which volume slider is being dragged
 let showFirstTips = false;                      // control hints on the first match
@@ -476,8 +477,16 @@ function menuTap(p) {
     case "HOWTO":
       game.state = "TITLE"; sfx("ui"); return;   // tap anywhere closes
     case "GAMEOVER": case "VICTORY":
-      if (net.role) netReset();
-      game.state = "TITLE"; return;
+      if (net.role === "host") {
+        if (inR(p, resultUI.rematch)) { sfx("ui"); netRematch(); }
+        else if (inR(p, resultUI.leave)) { sfx("ui"); netReset(); game.state = "TITLE"; }
+      } else if (net.role === "client") {
+        if (inR(p, resultUI.leave)) { sfx("ui"); netReset(); game.state = "TITLE"; }
+        // otherwise wait for the host to rematch
+      } else {
+        game.state = "TITLE";   // solo: tap anywhere
+      }
+      return;
     case "PAUSED": {
       if (inR(p, pauseUI.resume)) { sfx("ui"); game.state = "PLAYING"; }
       else if (inR(p, pauseUI.settings)) { sfx("ui"); settingsFrom = "PAUSED"; game.state = "SETTINGS"; }
@@ -491,7 +500,11 @@ function handleEnter() {
   else if (game.state === "WEAPONSELECT") startMatch();
   else if (game.state === "SETTINGS") game.state = settingsFrom;
   else if (game.state === "HOWTO" || game.state === "CREDITS") game.state = "TITLE";
-  else if (game.state === "GAMEOVER" || game.state === "VICTORY") { if (net.role) netReset(); game.state = "TITLE"; }
+  else if (game.state === "GAMEOVER" || game.state === "VICTORY") {
+    if (net.role === "host") netRematch();          // Enter = play again (host)
+    else if (net.role === "client") { /* wait for host */ }
+    else game.state = "TITLE";                       // solo
+  }
 }
 
 // Title-screen stage selector (positions filled in by drawTitle each frame)
@@ -2148,6 +2161,18 @@ function netStartHost() {
   netDirty.clear();   // starting puddles are deterministic on every client
 }
 
+// host: after a match ends, send the whole room back to the lobby (room intact),
+// so everyone can re-ready and play again without re-sharing the code.
+function netRematch() {
+  if (net.role !== "host") return;
+  net.started = false; net.startWarned = false; net.lastSnap = null; netDirty = null;
+  for (const p of net.players) p.ready = (p.faction === 0);   // host stays ready
+  net.status = allPlayersReady() ? "Everyone's ready — tap START" : "Room ready — share the code";
+  netBroadcast({ t: "rematch" });
+  netBroadcast(rosterMsg());
+  game.state = "LOBBY";
+}
+
 // ---------- CLIENT ----------
 function netJoin(code) {
   if (!netAvailable()) { net.status = "PeerJS not loaded"; return; }
@@ -2182,6 +2207,13 @@ function clientOnData(msg) {
     net.players = msg.roster.map(p => ({ ...p, isLocal: p.faction === localFaction }));
   } else if (msg.t === "stage") {
     if (msg.stage != null) currentLayout = msg.stage;   // host changed the arena
+  } else if (msg.t === "rematch") {
+    // host sent us back to the lobby for another round — re-ready up
+    net.started = false; net.lastSnap = null;
+    const me = net.players.find(p => p.faction === localFaction);
+    if (me) me.ready = false;
+    net.status = "Back in lobby — ready up";
+    game.state = "LOBBY";
   } else if (msg.t === "start") {
     if (msg.stage != null) currentLayout = msg.stage;
     net.started = true;
@@ -4044,11 +4076,31 @@ function drawResult(win) {
   ctx.fillStyle = PLAYER_COLOR; ctx.font = "bold " + Math.round(18 * S) + "px monospace";
   ctx.fillText("TOTAL  " + r.total, cx, sy + 24 * S);
 
-  // prompt
-  ctx.globalAlpha = 0.5 + 0.5 * Math.sin(bgT * 6);
-  ctx.fillStyle = "#fff"; ctx.font = "bold " + Math.round(12 * S) + "px monospace";
-  ctx.fillText(isTouch ? "TAP for title" : "CLICK or ENTER for title", cx, py0 + ph - 10 * S);
-  ctx.globalAlpha = 1; ctx.textAlign = "left";
+  // bottom: multiplayer rematch controls, or solo "tap for title" prompt
+  if (net.role) {
+    const bw = pw * 0.40, bh = 30 * S, gap = pw * 0.04, byy = py0 + ph - 40 * S;
+    if (net.role === "host") {
+      resultUI.rematch = { x: cx - bw - gap / 2, y: byy, w: bw, h: bh };
+      drawBtn(resultUI.rematch, "PLAY AGAIN", PLAYER_COLOR, true, 13 * S);
+      resultUI.leave = { x: cx + gap / 2, y: byy, w: bw, h: bh };
+      drawBtn(resultUI.leave, "LEAVE", "#e2724f", false, 12 * S);
+    } else {
+      ctx.globalAlpha = 0.5 + 0.5 * Math.sin(bgT * 6);
+      ctx.fillStyle = "#9cc7da"; ctx.font = Math.round(10 * S) + "px monospace";
+      ctx.fillText("Waiting for host to start a rematch…", cx, byy - 6 * S);
+      ctx.globalAlpha = 1;
+      resultUI.rematch = null;
+      resultUI.leave = { x: cx - bw / 2, y: byy, w: bw, h: bh };
+      drawBtn(resultUI.leave, "LEAVE", "#e2724f", false, 12 * S);
+    }
+  } else {
+    resultUI.rematch = resultUI.leave = null;
+    ctx.globalAlpha = 0.5 + 0.5 * Math.sin(bgT * 6);
+    ctx.fillStyle = "#fff"; ctx.font = "bold " + Math.round(12 * S) + "px monospace";
+    ctx.fillText(isTouch ? "TAP for title" : "CLICK or ENTER for title", cx, py0 + ph - 10 * S);
+    ctx.globalAlpha = 1;
+  }
+  ctx.textAlign = "left";
 }
 
 /* ============================================================
