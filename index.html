@@ -111,17 +111,44 @@ const OWN_NONE   = 0;
 const OWN_PLAYER = 1;
 const OWN_ENEMY  = 2;
 
-// Colors — ink stays bright-ish cyan; the shark BODY is a calmer shark-blue.
-// (Toned down overall so the arena doesn't feel over-bright.)
-const PLAYER_COLOR      = "#2ccada";   // cyan sea-ink (projectiles / tiles / UI)
-const PLAYER_COLOR_DARK = "#157f90";
+// Colors — the shark BODY stays a calmer shark-blue; the INK palette is
+// switchable (normal vs colorblind) via applyPalette().
 const PLAYER_BODY       = "#4aa3d4";   // shark-blue character body
 const PLAYER_BODY_DARK  = "#2a6791";
-const ENEMY_COLORS = [
-  { ink: "#d94bc0", dark: "#84287a", body: "#b06aa0" },  // magenta gang
-  { ink: "#d6ab3d", dark: "#8f6e14", body: "#c2a05c" },  // gold gang
-  { ink: "#62c748", dark: "#357f23", body: "#84bd6e" },  // lime gang
-];
+const PALETTES = {
+  // default: cyan player vs magenta / gold / lime gangs
+  normal: { player: "#2ccada", dark: "#157f90", enemies: [
+    { ink: "#d94bc0", dark: "#84287a", body: "#b06aa0" },
+    { ink: "#d6ab3d", dark: "#8f6e14", body: "#c2a05c" },
+    { ink: "#62c748", dark: "#357f23", body: "#84bd6e" },
+  ] },
+  // colorblind: high-contrast blue / orange / yellow / violet (avoids cyan↔magenta
+  // and red↔green confusion); rivals also keep numbered badges to tell them apart
+  cb: { player: "#2e9bff", dark: "#1560a8", enemies: [
+    { ink: "#ff7a1f", dark: "#b04e0e", body: "#ff9d57" },
+    { ink: "#ffd21e", dark: "#b08f10", body: "#ffe06a" },
+    { ink: "#b266ff", dark: "#6f33b0", body: "#cd9bff" },
+  ] },
+};
+let PLAYER_COLOR      = PALETTES.normal.player;   // cyan sea-ink (projectiles/tiles/UI)
+let PLAYER_COLOR_DARK = PALETTES.normal.dark;
+let ENEMY_COLORS = PALETTES.normal.enemies.map(e => ({ ...e }));
+let GANG_BY_INK = {};                              // ink colour -> gang index
+function applyPalette() {
+  const pal = (settings.colorblind) ? PALETTES.cb : PALETTES.normal;
+  const oldByInk = GANG_BY_INK;
+  // remap any already-painted tiles so a mid-match toggle stays consistent
+  try {
+    if (map && map.length) for (const t of map) {
+      if (t.owner === OWN_PLAYER) t.inkColor = pal.player;
+      else if (t.owner === OWN_ENEMY) { const gi = oldByInk[t.inkColor]; if (gi != null) t.inkColor = pal.enemies[gi].ink; }
+    }
+  } catch (e) { /* map not built yet */ }
+  PLAYER_COLOR = pal.player; PLAYER_COLOR_DARK = pal.dark;
+  ENEMY_COLORS = pal.enemies.map(e => ({ ...e }));
+  GANG_BY_INK = {}; ENEMY_COLORS.forEach((c, i) => { GANG_BY_INK[c.ink] = i; });
+}
+ENEMY_COLORS.forEach((c, i) => { GANG_BY_INK[c.ink] = i; });   // initial (normal) map
 
 // Decoration sub-types for obstacles (visual only)
 const D_CORAL = 0, D_ROCK = 1, D_CRATE = 2, D_SIGN = 3, D_BARRIER = 4;
@@ -149,6 +176,25 @@ const ctx = canvas.getContext("2d", { alpha: false });
 
 let VIEW_W = 0, VIEW_H = 0;   // logical render dimensions (control zoom + HUD)
 let UI = 1;                    // HUD scale factor derived from VIEW_W
+let safeT = 0, safeR = 0, safeB = 0, safeL = 0;  // device safe-area insets (logical px)
+
+// read the device safe-area insets (notches / nav bars) via a CSS probe
+let safeProbe = null;
+function measureSafe() {
+  if (!safeProbe) {
+    safeProbe = document.createElement("div");
+    safeProbe.style.cssText = "position:fixed;top:0;left:0;width:0;height:0;visibility:hidden;pointer-events:none;" +
+      "padding-top:env(safe-area-inset-top);padding-right:env(safe-area-inset-right);" +
+      "padding-bottom:env(safe-area-inset-bottom);padding-left:env(safe-area-inset-left);";
+    document.body.appendChild(safeProbe);
+  }
+  const cs = getComputedStyle(safeProbe);
+  const k = VIEW_W / Math.max(1, window.innerWidth);   // CSS px -> logical px
+  safeT = (parseFloat(cs.paddingTop) || 0) * k;
+  safeR = (parseFloat(cs.paddingRight) || 0) * k;
+  safeB = (parseFloat(cs.paddingBottom) || 0) * k;
+  safeL = (parseFloat(cs.paddingLeft) || 0) * k;
+}
 
 function resize() {
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
@@ -168,6 +214,7 @@ function resize() {
   ctx.setTransform(deviceScale, 0, 0, deviceScale, 0, 0);
   ctx.imageSmoothingEnabled = false;
   UI = clamp(VIEW_W / 760, 0.72, 1.4);   // HUD elements scale with the viewport
+  try { measureSafe(); } catch (e) { safeT = safeR = safeB = safeL = 0; }
   layoutMobileControls();
 }
 window.addEventListener("resize", resize);
@@ -251,8 +298,8 @@ function sfx(kind) {
   }
 }
 
-/* ---- SETTINGS (persisted): music/SFX volumes 0..1 ---- */
-const settings = { musicVol: 0.6, sfxVol: 0.8 };
+/* ---- SETTINGS (persisted): music/SFX volumes 0..1 + colorblind palette ---- */
+const settings = { musicVol: 0.6, sfxVol: 0.8, colorblind: false };
 try {
   const sv = JSON.parse(localStorage.getItem("reefRumble.settings"));
   if (sv) {
@@ -261,8 +308,10 @@ try {
     else if (sv.music === false) settings.musicVol = 0;
     if (typeof sv.sfxVol === "number") settings.sfxVol = clamp(sv.sfxVol, 0, 1);
     else if (sv.sfx === false) settings.sfxVol = 0;
+    settings.colorblind = !!sv.colorblind;
   }
 } catch (e) {}
+applyPalette();   // apply the saved palette before anything draws
 function saveSettings() { try { localStorage.setItem("reefRumble.settings", JSON.stringify(settings)); } catch (e) {} }
 
 /* ---- BACKGROUND MUSIC (synthesised loop, no files) ---- */
@@ -308,9 +357,10 @@ let mouseDown = false;
 let usingMouse = false;
 
 // menu hit-rects (filled in each frame by the matching draw function)
-const titleBtns   = { play: null, how: null, settings: null };
+const titleBtns   = { play: null, how: null, settings: null, credits: null };
+const creditsUI   = { back: null };
 const weaponUI    = { prev: null, next: null, start: null, back: null };
-const settingsUI  = { music: null, sfx: null, back: null };
+const settingsUI  = { music: null, sfx: null, colorblind: null, back: null };
 const howtoUI     = { back: null };
 const pauseUI     = { resume: null, menu: null, settings: null };
 let settingsFrom = "TITLE";                 // where the SETTINGS screen returns to
@@ -340,7 +390,7 @@ window.addEventListener("keydown", e => {
   if (k === "q" || k === "e") tryUlti();   // SPECIAL / ULTI
   if (k === "escape") {
     if (game.state === "SETTINGS") game.state = settingsFrom;
-    else if (game.state === "WEAPONSELECT" || game.state === "HOWTO") game.state = "TITLE";
+    else if (game.state === "WEAPONSELECT" || game.state === "HOWTO" || game.state === "CREDITS") game.state = "TITLE";
     else if (game.state === "PLAYING") game.state = "PAUSED";
   }
   // left/right: stage on title, weapon on the select screen
@@ -376,10 +426,13 @@ function menuTap(p) {
   switch (game.state) {
     case "TITLE":
       if (titleArrowHit(p)) return;
-      if (inR(p, titleBtns.play)) { sfx("ui"); game.state = "WEAPONSELECT"; }
+      if (inR(p, titleBtns.credits)) { sfx("ui"); game.state = "CREDITS"; }
+      else if (inR(p, titleBtns.play)) { sfx("ui"); game.state = "WEAPONSELECT"; }
       else if (inR(p, titleBtns.how)) { sfx("ui"); game.state = "HOWTO"; }
       else if (inR(p, titleBtns.settings)) { sfx("ui"); settingsFrom = "TITLE"; game.state = "SETTINGS"; }
       return;
+    case "CREDITS":
+      game.state = "TITLE"; sfx("ui"); return;   // tap anywhere / BACK closes
     case "WEAPONSELECT":
       if (inR(p, weaponUI.prev)) cycleWeapon(-1);
       else if (inR(p, weaponUI.next)) cycleWeapon(1);
@@ -389,6 +442,7 @@ function menuTap(p) {
     case "SETTINGS":
       if (inR(p, settingsUI.music)) { settingsDrag = "music"; setSliderFromX("music", p.x); sfx("ui"); }
       else if (inR(p, settingsUI.sfx)) { settingsDrag = "sfx"; setSliderFromX("sfx", p.x); sfx("ui"); }
+      else if (inR(p, settingsUI.colorblind)) { settings.colorblind = !settings.colorblind; applyPalette(); saveSettings(); sfx("ui"); }
       else if (inR(p, settingsUI.back)) { sfx("ui"); game.state = settingsFrom; }
       return;
     case "HOWTO":
@@ -407,7 +461,7 @@ function handleEnter() {
   if (game.state === "TITLE") game.state = "WEAPONSELECT";
   else if (game.state === "WEAPONSELECT") startMatch();
   else if (game.state === "SETTINGS") game.state = settingsFrom;
-  else if (game.state === "HOWTO") game.state = "TITLE";
+  else if (game.state === "HOWTO" || game.state === "CREDITS") game.state = "TITLE";
   else if (game.state === "GAMEOVER" || game.state === "VICTORY") game.state = "TITLE";
 }
 
@@ -1669,9 +1723,7 @@ function paintTiles(cx, cy, radius, owner, color) {
   }
 }
 
-// Which gang owns a given ink colour (rivals are distinguished by their ink)
-const GANG_BY_INK = {};
-ENEMY_COLORS.forEach((c, i) => { GANG_BY_INK[c.ink] = i; });
+// (GANG_BY_INK is maintained by applyPalette so it tracks the active palette)
 
 // Count coverage for the player and each of the 3 rival gangs separately
 function tallyTerritory() {
@@ -1838,6 +1890,7 @@ function renderScene() {
   if (game.state === "WEAPONSELECT") { drawWeaponSelect(); return; }
   if (game.state === "SETTINGS") { drawSettings(); return; }
   if (game.state === "HOWTO") { drawHowTo(); return; }
+  if (game.state === "CREDITS") { drawCredits(); return; }
 
   drawArena();
 
@@ -2493,7 +2546,7 @@ function hudBar(x, y, w, h, frac, col) {
     ctx.fillStyle = "rgba(255,255,255,0.22)"; ctx.fillRect(x + 1, y + 1, fw, 1); // gloss
   }
 }
-function pauseBtn() { return { x: VIEW_W - 16 * UI, y: 16 * UI, r: 12 * UI }; }
+function pauseBtn() { return { x: VIEW_W - safeR - 20 * UI, y: safeT + 18 * UI, r: 12 * UI }; }
 function ovScale() { return clamp(Math.min(VIEW_W / 520, VIEW_H / 360), 0.6, 1.6); }
 function inRect(px, py, r) { return px >= r.x && px <= r.x + r.w && py >= r.y && py <= r.y + r.h; }
 
@@ -2656,7 +2709,8 @@ function drawHUD() {
 // Minimap (radar) top-right showing ink ownership
 function drawMinimap() {
   const mw = 84 * UI, box = mw / MAP_W;
-  const mx = VIEW_W - mw - 8 * UI, my = 38 * UI;
+  // keep clear of the device's right/top safe area (notch / nav bar)
+  const mx = VIEW_W - mw - safeR - 12 * UI, my = safeT + 42 * UI;
   hudPanel(mx - 4 * UI, my - 4 * UI, mw + 8 * UI, mw + 8 * UI);
   for (let y = 0; y < MAP_H; y++) {
     for (let x = 0; x < MAP_W; x++) {
@@ -2771,12 +2825,17 @@ function drawTitle() {
   ctx.fillStyle = "rgba(3,12,22,0.34)"; ctx.fillRect(0, 0, VIEW_W, VIEW_H);
 
   if (wide) {
-    drawTitleHero(VIEW_W * 0.30, cy, S);
-    drawTitleMenu(VIEW_W * 0.71, cy, S, Math.min(VIEW_W * 0.44, 380 * S));
+    // two columns with a clear gap: hero on the left, menu pushed to the right edge
+    drawTitleHero(VIEW_W * 0.27, cy, S);
+    drawTitleMenu(VIEW_W * 0.74, cy, S, Math.min(VIEW_W * 0.40, 360 * S));
   } else {
     drawTitleHero(cx, VIEW_H * 0.30, S * 0.92);
     drawTitleMenu(cx, VIEW_H * 0.70, S, Math.min(VIEW_W * 0.9, 360 * S));
   }
+
+  // CREDITS button — top-left, clear of the safe area
+  titleBtns.credits = { x: safeL + 10 * S, y: safeT + 10 * S, w: 78 * S, h: 24 * S };
+  drawBtn(titleBtns.credits, "CREDITS", "#7fb0c6", false, 10 * S);
 
   // footer hint
   ctx.textAlign = "center";
@@ -2785,10 +2844,51 @@ function drawTitle() {
   ctx.textAlign = "left";
 }
 
+/* ---------- CREDITS ---------- */
+function drawCredits() {
+  const S = ovScale(), cx = VIEW_W / 2;
+  ctx.fillStyle = "rgba(3,12,22,0.5)"; ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+  const pw = Math.min(VIEW_W * 0.86, 420 * S), ph = Math.min(VIEW_H * 0.9, 360 * S);
+  const x0 = cx - pw / 2, y0 = VIEW_H / 2 - ph / 2;
+  hudPanel(x0, y0, pw, ph);
+  ctx.textAlign = "center";
+  ctx.fillStyle = PLAYER_COLOR; ctx.font = "bold " + Math.round(26 * S) + "px 'Trebuchet MS'";
+  ctx.fillText("CREDITS", cx, y0 + 36 * S);
+  ctx.fillStyle = ENEMY_COLORS[0].ink; ctx.font = "bold " + Math.round(16 * S) + "px 'Trebuchet MS'";
+  ctx.fillText("REEF RUMBLE", cx, y0 + 60 * S);
+
+  const lines = [
+    ["", "An original isometric shark ink-battle arena."],
+    ["DESIGN & CODE", "Built from scratch in vanilla JavaScript."],
+    ["ART", "Procedural pixel-art — every shark, tile & VFX"],
+    ["", "drawn live on an HTML5 Canvas."],
+    ["AUDIO", "Synthesised on the fly with the Web Audio API."],
+    ["ASSETS", "None — no engines, libraries, images or files."],
+    ["", "Made for the love of splatty arena games. © 2026"],
+  ];
+  let yy = y0 + 86 * S; const lh = Math.min(26 * S, (ph - 150 * S) / lines.length);
+  for (const row of lines) {
+    if (row[0]) {
+      ctx.textAlign = "left"; ctx.fillStyle = "#7fb0c6"; ctx.font = "bold " + Math.round(9 * S) + "px monospace";
+      ctx.fillText(row[0], x0 + pw * 0.08, yy);
+      ctx.fillStyle = "#cfe9ff"; ctx.font = Math.round(9.5 * S) + "px monospace";
+      ctx.fillText(row[1], x0 + pw * 0.30, yy);
+    } else {
+      ctx.textAlign = "center"; ctx.fillStyle = "#9cc7da"; ctx.font = Math.round(9.5 * S) + "px monospace";
+      ctx.fillText(row[1], cx, yy);
+    }
+    yy += lh;
+  }
+  creditsUI.back = { x: cx - 54 * S, y: y0 + ph - 38 * S, w: 108 * S, h: 28 * S };
+  ctx.textAlign = "center";
+  drawBtn(creditsUI.back, "BACK", "#7fb0c6", false, 12 * S);
+  ctx.textAlign = "left";
+}
+
 // Hero: big logo + mascot on a glow platform
 function drawTitleHero(cx, cy, S) {
   const titleY = cy - 64 * S;
-  const tw = Math.min(VIEW_W * 0.52, 460 * S);
+  const tw = Math.min(VIEW_W * 0.44, 440 * S);   // keep the logo clear of the menu card
   ctx.textAlign = "center";
   const tpx = fitFont("REEF RUMBLE", tw, 52 * S);
   ctx.font = "bold " + tpx + "px 'Trebuchet MS', sans-serif";
@@ -2923,15 +3023,18 @@ function drawWeaponSelect() {
   // LEFT: character preview
   const lpX = VIEW_W * 0.05, lpY = VIEW_H * 0.22, lpW = VIEW_W * 0.36, lpH = VIEW_H * 0.56;
   hudPanel(lpX, lpY, lpW, lpH);
-  const cScale = Math.max(1.4, Math.min(lpW, lpH) / 70);
+  // size the shark so the whole sprite (incl. fin) fits with padding above the head
+  const padTop = 18 * S, cxp = lpX + lpW / 2;
+  const feetY = lpY + lpH * 0.74;            // stand it in the lower-middle of the card
+  const cScale = clamp(Math.min((lpW * 0.56) / 40, (feetY - lpY - padTop) / 46), 1.2, 3.2);
   ctx.save();
-  ctx.translate(lpX + lpW / 2, lpY + lpH * 0.64);
+  ctx.translate(cxp, feetY);
   ctx.scale(cScale, cScale);
   drawChibiBody(PLAYER_BODY, PLAYER_BODY_DARK, PLAYER_COLOR, true, bgT * 2, false);
   ctx.restore();
-  drawBlaster(lpX + lpW / 2 + 6 * cScale, lpY + lpH * 0.64 - 9 * cScale, -0.35, PLAYER_COLOR, PLAYER_BODY_DARK, weaponSel);
-  ctx.fillStyle = "#bfe9ff"; ctx.font = "bold " + Math.round(10 * S) + "px monospace"; ctx.textAlign = "center";
-  ctx.fillText("YOUR WARRIOR", lpX + lpW / 2, lpY + lpH - 10 * S);
+  drawBlaster(cxp + 6 * cScale, feetY - 9 * cScale, -0.35, PLAYER_COLOR, PLAYER_BODY_DARK, weaponSel);
+  ctx.fillStyle = "#7fb0c6"; ctx.font = "bold " + Math.round(9 * S) + "px monospace"; ctx.textAlign = "center";
+  ctx.fillText("REEF WARRIOR", cxp, lpY + lpH - 10 * S);
 
   // RIGHT: weapon card
   const rX = VIEW_W * 0.44, rY = VIEW_H * 0.22, rW = VIEW_W * 0.51, rH = VIEW_H * 0.56;
@@ -2995,16 +3098,31 @@ function drawSliderRow(r, label, value, S) {
   ctx.fillStyle = value <= 0 ? "#3c5560" : PLAYER_COLOR; ctx.beginPath(); ctx.arc(kx, ky, kr * 0.55, 0, TAU); ctx.fill();
   ctx.textAlign = "left";
 }
+// compact ON/OFF toggle row
+function drawToggle(r, label, on, S) {
+  ctx.textBaseline = "middle"; ctx.textAlign = "left";
+  ctx.fillStyle = "#cfe9ff"; ctx.font = "bold " + Math.round(11 * S) + "px monospace";
+  ctx.fillText(label, r.x, r.y + r.h / 2);
+  const pw = 46 * S, ph = 20 * S, px = r.x + r.w - pw, py = r.y + (r.h - ph) / 2;
+  ctx.fillStyle = on ? "#1f6e42" : "#3a4650"; rrect(px, py, pw, ph);
+  const knob = ph - 4;
+  ctx.fillStyle = on ? "#3dff8a" : "#9fb3bd"; rrect(on ? px + pw - knob - 2 : px + 2, py + 2, knob, knob);
+  ctx.fillStyle = "#eaffff"; ctx.font = "bold " + Math.round(8 * S) + "px monospace"; ctx.textAlign = "center";
+  ctx.fillText(on ? "ON" : "OFF", on ? px + (pw - knob) / 2 : px + pw - (pw - knob) / 2, py + ph / 2);
+  ctx.textBaseline = "alphabetic"; ctx.textAlign = "left";
+}
 function drawSettings() {
   const S = ovScale(), cx = VIEW_W / 2, cy = VIEW_H / 2;
-  const pw = Math.min(VIEW_W * 0.82, 360 * S), ph = Math.min(VIEW_H * 0.82, 240 * S);
-  hudPanel(cx - pw / 2, cy - ph / 2, pw, ph);
+  const pw = Math.min(VIEW_W * 0.84, 380 * S), ph = Math.min(VIEW_H * 0.9, 296 * S);
+  const py0 = cy - ph / 2;
+  hudPanel(cx - pw / 2, py0, pw, ph);
   ctx.textAlign = "center"; ctx.fillStyle = PLAYER_COLOR; ctx.font = "bold " + Math.round(26 * S) + "px 'Trebuchet MS'";
-  ctx.fillText("SETTINGS", cx, cy - ph / 2 + 36 * S);
-  const rw = pw * 0.74, rx = cx - rw / 2, rh = 11 * S; let ry = cy - ph * 0.04;
-  settingsUI.music = { x: rx, y: ry, w: rw, h: rh }; drawSliderRow(settingsUI.music, "MUSIC", settings.musicVol, S); ry += rh + 38 * S;
-  settingsUI.sfx = { x: rx, y: ry, w: rw, h: rh }; drawSliderRow(settingsUI.sfx, "SOUND FX", settings.sfxVol, S);
-  settingsUI.back = { x: cx - 52 * S, y: cy + ph / 2 - 40 * S, w: 104 * S, h: 28 * S };
+  ctx.fillText("SETTINGS", cx, py0 + 34 * S);
+  const rw = pw * 0.74, rx = cx - rw / 2; let ry = py0 + 66 * S;
+  settingsUI.music = { x: rx, y: ry, w: rw, h: 11 * S }; drawSliderRow(settingsUI.music, "MUSIC", settings.musicVol, S); ry += 44 * S;
+  settingsUI.sfx = { x: rx, y: ry, w: rw, h: 11 * S }; drawSliderRow(settingsUI.sfx, "SOUND FX", settings.sfxVol, S); ry += 30 * S;
+  settingsUI.colorblind = { x: rx, y: ry, w: rw, h: 24 * S }; drawToggle(settingsUI.colorblind, "COLORBLIND", settings.colorblind, S);
+  settingsUI.back = { x: cx - 54 * S, y: py0 + ph - 40 * S, w: 108 * S, h: 28 * S };
   drawBtn(settingsUI.back, "BACK", "#7fb0c6", false, 12 * S);
   ctx.textAlign = "left";
 }
