@@ -948,6 +948,7 @@ const net = {
   inputAccum: 0,       // (client) input send timer
   lastSnap: null,      // (client) most recent snapshot to apply
   started: false,      // match has begun
+  startWarned: false,  // (host) shown the "not everyone is ready" warning once
 };
 
 const camera = { x: 0, y: 0, tx: 0, ty: 0 };
@@ -2036,7 +2037,7 @@ function netReset() {
   net.role = null; net.peer = null; net.conns = []; net.hostConn = null;
   net.roomCode = null; net.mode = null; net.players = []; net.factionConn = {};
   net.ultiPending = false; net.snapAccum = 0; net.inputAccum = 0;
-  net.lastSnap = null; net.started = false;
+  net.lastSnap = null; net.started = false; net.startWarned = false;
   netProj = []; netDirty = null;
 }
 
@@ -2082,6 +2083,7 @@ function hostOnConnect(conn) {
   conn._faction = f; net.factionConn[f] = conn; net.conns.push(conn);
   net.players.push({ faction: f, name: "Player " + f, ready: false, conn });
   conn.send({ t: "assign", faction: f, code: net.roomCode, stage: currentLayout });
+  net.startWarned = false;   // a new arrival → re-arm the "not ready" warning
   netBroadcast(rosterMsg());
 }
 
@@ -2095,6 +2097,10 @@ function hostOnData(conn, msg) {
   } else if (msg.t === "ready") {
     const p = net.players.find(x => x.faction === f);
     if (p) p.ready = !!msg.ready;
+    // someone changed their ready state → clear any stale "not ready" warning
+    net.startWarned = false;
+    if (allPlayersReady()) net.status = "Everyone's ready — tap START";
+    else net.status = "Room ready — share the code";
     netBroadcast(rosterMsg());
   } else if (msg.t === "input" && net.started) {
     const sh = sharks[f];
@@ -2110,8 +2116,14 @@ function hostOnClose(conn) {
     net.players = net.players.filter(p => p.faction !== f);
     // mid-match: that faction reverts to a bot
     if (net.started && sharks[f]) { sharks[f].isBot = true; sharks[f].netInput = null; }
+    net.startWarned = false;
     netBroadcast(rosterMsg());
   }
+}
+
+// true when every joined (non-host) player has tapped READY (host is always ready)
+function allPlayersReady() {
+  return net.players.every(p => p.faction === 0 || p.ready);
 }
 
 function netStartHost() {
@@ -3392,7 +3404,7 @@ function drawLobby() {
     ctx.fillText(net.role === "host" ? "ROOM CODE — share it" : "ROOM CODE", cx, y0 + 56 * S);
     ctx.fillStyle = "#ffd23d"; ctx.font = "bold " + Math.round(30 * S) + "px monospace";
     ctx.fillText(net.roomCode || "…", cx, y0 + 86 * S);
-    ctx.fillStyle = "#9cc7da"; ctx.font = Math.round(9 * S) + "px monospace";
+    ctx.fillStyle = net.startWarned ? "#ffb03d" : "#9cc7da"; ctx.font = (net.startWarned ? "bold " : "") + Math.round(9 * S) + "px monospace";
     ctx.fillText(net.status || "", cx, y0 + 104 * S);
 
     let ry = y0 + 128 * S;
@@ -3442,8 +3454,19 @@ function lobbyTap(p) {
     return;
   }
   if (net.role === "host") {
-    if (inR(p, lobbyUI.start)) { sfx("ui"); netStartHost(); }
-    else if (inR(p, lobbyUI.leave)) { sfx("ui"); netReset(); game.state = "TITLE"; }
+    if (inR(p, lobbyUI.start)) {
+      sfx("ui");
+      // warn (once) if any joined player hasn't readied — second tap starts anyway
+      if (!allPlayersReady() && !net.startWarned) {
+        net.startWarned = true;
+        const waiting = net.players.filter(pl => pl.faction !== 0 && !pl.ready);
+        net.status = (waiting.length === 1)
+          ? (waiting[0].name + " isn't ready — tap START again to begin")
+          : (waiting.length + " players aren't ready — tap START again to begin");
+        return;
+      }
+      netStartHost();
+    } else if (inR(p, lobbyUI.leave)) { sfx("ui"); netReset(); game.state = "TITLE"; }
   } else {
     if (inR(p, lobbyUI.ready)) {
       sfx("ui");
