@@ -969,6 +969,8 @@ const net = {
   lastSnap: null,      // (client) most recent snapshot to apply
   started: false,      // match has begun
   startWarned: false,  // (host) shown the "not everyone is ready" warning once
+  connecting: false,   // (client) join handshake in progress (drives the timeout)
+  connectT: 0,         // (client) seconds spent trying to connect
 };
 
 const camera = { x: 0, y: 0, tx: 0, ty: 0 };
@@ -1980,6 +1982,8 @@ function hostSnap(dt) {
 }
 
 function update(dt) {
+  netConnectTick(dt);   // (client) join-handshake timeout, any state
+
   // CLIENT: never run the sim — interpolate snapshots + send input only
   if (net.role === "client") {
     if (game.state === "PLAYING") netClientTick(dt);
@@ -2051,6 +2055,7 @@ function endMatch() {
    ============================================================ */
 const NET_ID_PREFIX = "reefrumble-";      // namespace on the shared public broker
 const SNAP_HZ = 20, INPUT_HZ = 30;
+const JOIN_TIMEOUT = 9;                    // (client) give up connecting after N seconds
 let netProj = [];                          // (client) projectiles from last snapshot
 let netEvents = [];                         // (host) hit/death VFX events since last snapshot
 let localProj = [];                         // (client) own predicted projectiles (visual)
@@ -2071,6 +2076,7 @@ function netReset() {
   net.roomCode = null; net.mode = null; net.players = []; net.factionConn = {};
   net.ultiPending = false; net.snapAccum = 0; net.inputAccum = 0;
   net.lastSnap = null; net.started = false; net.startWarned = false;
+  net.connecting = false; net.connectT = 0;
   netProj = []; netEvents = []; localProj = []; netDirty = null;
 }
 
@@ -2192,15 +2198,16 @@ function netRematch() {
 
 // ---------- CLIENT ----------
 function netJoin(code) {
-  if (!netAvailable()) { net.status = "PeerJS not loaded"; return; }
+  if (!netAvailable()) { net.status = "Online needs a network connection"; return; }
   netReset();
   net.role = "client"; net.mode = "join"; net.status = "Connecting…";
-  net.roomCode = code;
+  net.roomCode = code; net.connecting = true; net.connectT = 0;
   net.peer = new Peer();
   net.peer.on("open", () => {
     const conn = net.peer.connect(NET_ID_PREFIX + code, { reliable: true });
     net.hostConn = conn;
     conn.on("open", () => {
+      net.connecting = false;                       // handshake succeeded
       net.status = "Connected — waiting in lobby";
       conn.send({ t: "join", name: playerName, weaponIdx: weaponSel });
     });
@@ -2210,16 +2217,36 @@ function netJoin(code) {
   });
   net.peer.on("error", (e) => {
     const ty = e && e.type ? e.type : "unknown";
-    net.status = (ty === "peer-unavailable") ? "Room not found — check the code" : "Network error: " + ty;
+    if (!net.connecting) return;   // already in the room → disconnects handled via conn.close
+    if (ty === "peer-unavailable") netJoinFailed("Room not found — check the code");
+    else if (ty === "network" || ty === "server-error" || ty === "socket-error" || ty === "socket-closed")
+      netJoinFailed("Network error — try again");
+    else net.status = "Connection issue: " + ty;   // non-fatal; the timeout still guards
   });
+}
+
+// (client) join handshake didn't complete → back to the multiplayer choice screen
+// with a clear reason, room torn down so they can retry or host instead.
+function netJoinFailed(msg) {
+  netReset();
+  net.status = msg || "Couldn't connect";
+  game.state = "LOBBY";   // choice screen (net.mode === null) shows the reason
+}
+
+// (client) drive the connect timeout from the frame loop (no setTimeout needed)
+function netConnectTick(dt) {
+  if (!net.connecting) return;
+  net.connectT += dt;
+  if (net.connectT >= JOIN_TIMEOUT) netJoinFailed("Couldn't connect — check the code or try again");
 }
 
 function clientOnData(msg) {
   if (!msg || !msg.t) return;
   if (msg.t === "assign") {
+    net.connecting = false;
     localFaction = msg.faction; net.roomCode = msg.code;
     if (msg.stage != null) currentLayout = msg.stage;
-    net.status = "In lobby — faction " + msg.faction;
+    net.status = "In lobby — ready up when you're set";
   } else if (msg.t === "lobby") {
     net.players = msg.roster.map(p => ({ ...p, isLocal: p.faction === localFaction }));
   } else if (msg.t === "stage") {
@@ -2246,9 +2273,10 @@ function clientOnData(msg) {
 
 function clientLostHost(reason) {
   if (net.role !== "client") return;
+  const wasPlaying = net.started || game.state === "PLAYING";
   netReset();
-  net.status = reason || "Host disconnected";
-  game.state = "TITLE";
+  net.status = reason || (wasPlaying ? "Host left the game" : "Disconnected from host");
+  game.state = "LOBBY";   // back to the multiplayer choice screen with the reason shown
 }
 
 function clientEndMatch(counts) {
@@ -3611,9 +3639,14 @@ function drawLobby() {
     drawBtn(lobbyUI.back, "BACK", "#7fb0c6", false, 12 * S);
     lobbyUI.start = lobbyUI.ready = lobbyUI.leave = null;
     lobbyUI.name = lobbyUI.wPrev = lobbyUI.wNext = lobbyUI.sPrev = lobbyUI.sNext = null;
+    // surface the last connection result (e.g. "Room not found", "Host left")
+    if (net.status) {
+      ctx.fillStyle = "#ffb03d"; ctx.font = "bold " + Math.round(9.5 * S) + "px monospace";
+      ctx.fillText(net.status, cx, y0 + ph - 34 * S);
+    }
     if (!netAvailable()) {
       ctx.fillStyle = "#e2724f"; ctx.font = Math.round(9 * S) + "px monospace";
-      ctx.fillText("Online needs a network connection (PeerJS).", cx, y0 + ph - 16 * S);
+      ctx.fillText("Online needs a network connection.", cx, y0 + ph - 16 * S);
     }
   } else {
     // ---- room code (compact) ----
