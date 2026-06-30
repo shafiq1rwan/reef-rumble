@@ -1001,6 +1001,7 @@ function startMatch(opts) {
   sharks = all;                          // all 4 factions, indexable by faction id
   projectiles.length = 0; particles.length = 0; floaters.length = 0; impacts.length = 0;
   pickups.length = 0; pickupTimer = 4; flashes.length = 0; auras.length = 0; inkStorm = null;
+  localProj.length = 0; netEvents.length = 0;   // clear MP predicted shots / events
   game.time = MATCH_TIME;
   game.shake = 0; game.flash = 0;
   game.countdown = 3.0;      // 3 · 2 · 1 · GO! intro
@@ -1289,6 +1290,8 @@ function deathBurst(x, y, color) {
   for (let i = 0; i < 6; i++)                // rising bubbles
     spawnParticle(x + rand(-0.5, 0.5), y, rand(-0.6, 0.6), rand(-0.4, 0.4), "#bfe9ff", rand(0.6, 1.1), rand(1, 2), 0.05);
   game.shake = Math.min(13, game.shake + 9);
+  // (MP host) replicate the splat burst to clients
+  if (net.role === "host") netEvents.push({ k: 2, x: +x.toFixed(2), y: +y.toFixed(2), c: color });
 }
 
 // Cheerful "pop back in" when a shark respawns — halo rings + sparkle puff + a
@@ -1665,6 +1668,14 @@ function onSplash(x, y, faction, color, dark, splashR, splashDmg) {
     if (sh.faction === faction || sh.dead || sh.iframe > 0) continue;
     if (dist(x, y, sh.x, sh.y) < splashR * 0.6) { damageShark(sh, splashDmg, faction); didHit = true; }
   }
+  splashFX(x, y, color, splashR, didHit);
+  // (MP host) tell clients a splash happened here so they replay the same VFX
+  if (net.role === "host") netEvents.push({ k: 1, x: +x.toFixed(2), y: +y.toFixed(2), c: color, r: +splashR.toFixed(2), h: didHit ? 1 : 0 });
+}
+
+// VFX-only part of a splash (no paint / no damage) — shared by the host sim and
+// the client event replay so a bullet impact looks identical on every screen.
+function splashFX(x, y, color, splashR, didHit) {
   const big = splashR >= 2.8;
   // ink splat decal + expanding ring on the floor (bigger/brighter on a hit)
   addImpact(x, y, didHit ? "#ffffff" : color, didHit || big, color);
@@ -2039,8 +2050,10 @@ function endMatch() {
    render the authoritative state. Works from static hosting (GitHub Pages).
    ============================================================ */
 const NET_ID_PREFIX = "reefrumble-";      // namespace on the shared public broker
-const SNAP_HZ = 18, INPUT_HZ = 30;
+const SNAP_HZ = 20, INPUT_HZ = 30;
 let netProj = [];                          // (client) projectiles from last snapshot
+let netEvents = [];                         // (host) hit/death VFX events since last snapshot
+let localProj = [];                         // (client) own predicted projectiles (visual)
 let netReady = false;                      // PeerJS library present?
 
 function netAvailable() { return typeof Peer !== "undefined"; }
@@ -2058,7 +2071,7 @@ function netReset() {
   net.roomCode = null; net.mode = null; net.players = []; net.factionConn = {};
   net.ultiPending = false; net.snapAccum = 0; net.inputAccum = 0;
   net.lastSnap = null; net.started = false; net.startWarned = false;
-  netProj = []; netDirty = null;
+  netProj = []; netEvents = []; localProj = []; netDirty = null;
 }
 
 function netBroadcast(msg) {
@@ -2269,8 +2282,9 @@ function buildSnapshot() {
   for (const p of pickups) if (p.active) pk.push({ x: +p.x.toFixed(2), y: +p.y.toFixed(2), ty: p.type });
   const tiles = [];
   if (netDirty) { for (const i of netDirty) { const t = map[i]; if (t) tiles.push([i, t.team, +t.ink.toFixed(2)]); } netDirty.clear(); }
+  const ev = netEvents; netEvents = [];   // drain hit/death VFX events
   return {
-    t: "snap", s, pr, pk, tiles,
+    t: "snap", s, pr, pk, tiles, ev,
     pct: game.pct.factions.map(v => +v.toFixed(1)),
     time: +game.time.toFixed(1), cd: +game.countdown.toFixed(2), st: game.state,
   };
@@ -2295,6 +2309,11 @@ function netApply(snap) {
     t.pulse = 1;
   }
   netProj = snap.pr || [];
+  // replay hit/death VFX events so impacts/splats look juicy on the client too
+  if (snap.ev) for (const e of snap.ev) {
+    if (e.k === 1) splashFX(e.x, e.y, e.c, e.r, !!e.h);   // bullet splash
+    else if (e.k === 2) deathBurst(e.x, e.y, e.c);        // splat burst
+  }
   // rebuild client pickup list for rendering
   pickups.length = 0;
   for (const p of (snap.pk || [])) pickups.push({ x: p.x, y: p.y, type: p.ty, active: true, life: 10, bob: 0 });
@@ -2375,6 +2394,43 @@ function predictLocalShark(dt) {
   sh.facing = scr.x >= 0 ? 1 : -1;
 }
 
+// (client) Predict your OWN shots so firing feels instant: muzzle flash + sound +
+// a visual projectile the moment you press fire, instead of waiting for the host's
+// echo. Ink/cooldown are estimated locally (host corrects via snapshots); the host
+// stays authoritative for actual damage + paint (its splash arrives as an event).
+function predictLocalFire(dt) {
+  const sh = player;
+  sh.shootCd = (sh.shootCd || 0) - dt;
+  if (sh.dead || sh.diving) return;
+  const wpn = sh.weapon || WEAPONS[0];
+  const firing = (mouseDown || keys[" "] || btnShoot.pressed);
+  if (firing && sh.shootCd <= 0 && sh.ink >= wpn.cost) {
+    sh.shootCd = wpn.cd;
+    sh.ink = Math.max(0, sh.ink - wpn.cost);   // local estimate; snapshot re-syncs
+    sh.squash = -0.5;
+    for (let i = 0; i < wpn.pellets; i++) {
+      const spreadOff = wpn.pellets > 1 ? (i - (wpn.pellets - 1) / 2) * wpn.spread : 0;
+      const ang = sh.aim + spreadOff + rand(-wpn.spread, wpn.spread) * (wpn.pellets > 1 ? 0.3 : 1);
+      const dx = Math.cos(ang), dy = Math.sin(ang);
+      localProj.push({ x: sh.x + dx * 0.4, y: sh.y + dy * 0.4, dx, dy, speed: wpn.speed, range: wpn.range,
+        travelled: 0, color: sh.color, r: wpn.big ? 0.42 : 0.28, alive: true });
+    }
+    addFlash(sh.x + Math.cos(sh.aim) * 0.45, sh.y + Math.sin(sh.aim) * 0.45, sh.aim, sh.color);
+    sfx("shoot");
+  }
+}
+// move/expire the client's own predicted projectiles (visual only — no paint/damage)
+function updateLocalProj(dt) {
+  for (const p of localProj) {
+    if (!p.alive) continue;
+    const step = p.speed * dt;
+    p.x += p.dx * step; p.y += p.dy * step; p.travelled += step;
+    const t = tileAt(Math.floor(p.x), Math.floor(p.y));
+    if (p.travelled >= p.range || !t || t.terrain === T_OBST) p.alive = false;
+  }
+  for (let i = localProj.length - 1; i >= 0; i--) if (!localProj[i].alive) localProj.splice(i, 1);
+}
+
 // (client) smooth toward the latest authoritative shark transforms + run VFX only
 function netClientTick(dt) {
   if (net.lastSnap) { netApply(net.lastSnap); net.lastSnap = null; }
@@ -2392,6 +2448,7 @@ function netClientTick(dt) {
         const c = Math.min(1, dt * 6);
         player.x += ex * c; player.y += ey * c;
       }
+      predictLocalFire(dt);   // instant muzzle/shot feedback for your own fire
     }
     if (player.ultiFlash > 0) player.ultiFlash -= dt;
     if (player.popIn > 0) player.popIn -= dt;
@@ -2409,6 +2466,7 @@ function netClientTick(dt) {
     if (Math.abs(sh.netX - sh.x) + Math.abs(sh.netY - sh.y) > 0.02) sh.walkPhase += dt * 8;
   }
   // local-only visual effects (host owns the sim)
+  updateLocalProj(dt);
   updateParticles(dt); updateImpacts(dt); updateFlashes(dt); updateAuras(dt); updateInkStorm(dt);
   for (const p of pickups) p.bob += dt * 3;
   updateCamera(dt);
@@ -2678,10 +2736,17 @@ function drawArena() {
     drawList.push({ depth: e.x + e.y + 0.5, type: "enemy", e });
   if (!player.dead) drawList.push({ depth: player.x + player.y + 0.5, type: "player" });
   for (const p of projectiles) if (p.alive) drawList.push({ depth: p.x + p.y + 0.4, type: "proj", p });
-  // client: projectiles come from the host's snapshot (render-only blobs)
-  if (net.role === "client") for (const p of netProj) {
-    const fc = FACTION_COLORS[p.f] || FACTION_COLORS[0];
-    drawList.push({ depth: p.x + p.y + 0.4, type: "proj", p: { x: p.x, y: p.y, color: fc.ink, travelled: 0, range: 1 } });
+  // client: projectiles come from the host's snapshot (render-only blobs). Skip
+  // your OWN faction's shots — those are drawn from local prediction instead so
+  // there's no doubled/laggy ghost of your fire.
+  if (net.role === "client") {
+    for (const p of netProj) {
+      if (p.f === localFaction) continue;
+      const fc = FACTION_COLORS[p.f] || FACTION_COLORS[0];
+      drawList.push({ depth: p.x + p.y + 0.4, type: "proj", p: { x: p.x, y: p.y, color: fc.ink, travelled: 0, range: 1 } });
+    }
+    for (const p of localProj) if (p.alive)
+      drawList.push({ depth: p.x + p.y + 0.4, type: "proj", p: { x: p.x, y: p.y, color: p.color, travelled: p.travelled, range: p.range } });
   }
   for (const p of pickups) if (p.active) drawList.push({ depth: p.x + p.y + 0.3, type: "pickup", p });
 
