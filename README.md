@@ -128,6 +128,9 @@ Three hand-designed, symmetric arenas (pick on the title screen):
 
 ## Features
 
+- **Online 4-player free-for-all**, peer-to-peer via WebRTC (see Multiplayer above) -
+  host-authoritative with client-side movement/fire prediction for a responsive feel,
+  a ready-up lobby, and instant rematches without re-hosting.
 - Isometric 2.5D arena rendered with crisp, chunky pixel art (Canvas 2D).
 - Animated ocean: drifting waves, sparkles, rising bubbles, ink-reflection glow,
   and foam framing the floating stage.
@@ -136,22 +139,31 @@ Three hand-designed, symmetric arenas (pick on the title screen):
 - Rival AI with **A\*** pathfinding, territory painting, chasing, recharging, and
   diving.
 - Juicy game feel: muzzle flashes, ink-splat decals, particles, hit flashes,
-  gentle screen shake, tile pulses, and squash/stretch.
-- Procedural **WebAudio** sound effects (no audio files).
+  gentle screen shake, tile pulses, and squash/stretch - replicated live to every
+  player in multiplayer, not just the host.
+- An animated **results screen** reveal: ink rain, a bouncy panel/title pop, a
+  sweeping territory bar, and cascading standings.
+- Procedural **WebAudio** sound effects and music (no audio files).
 - Responsive HUD, minimap, and title/pause/victory/defeat screens that scale to
-  any viewport; full desktop **and** mobile controls.
+  any viewport; full desktop **and** mobile controls; colorblind palette and
+  Performance mode in Settings.
 
 ---
 
 ## Tech notes
 
-- **One file:** all code lives in `index.html`. Keep it dependency-free.
-- **Rendering:** the game draws into a low-resolution offscreen buffer, then
-  blits it to a device-resolution canvas with image smoothing off - guaranteed
-  crisp pixels instead of a blurry browser upscale.
+- **Nearly one file:** all game logic lives in `index.html`. The one dependency is
+  bundled PeerJS (`vendor/peerjs.min.js`) for multiplayer's WebRTC signaling - solo
+  play stays fully dependency-free and offline.
+- **Rendering:** the game draws directly to a device-resolution canvas (crisp text
+  and shapes) with image smoothing off - no blurry browser upscale.
 - **Performance:** tile-level painting (no per-pixel ops), object pools for
-  projectiles/particles, seeded background effects, and `requestAnimationFrame`
-  with delta-time movement - tuned to stay smooth on mobile.
+  projectiles/particles, seeded background effects, delta-time movement, and an
+  optional **Performance mode** (Settings) that trims visuals further for low-end
+  devices.
+- **Tested with a real regression suite:** `node tools/smoke-test.cjs` runs the game
+  logic under Node (stubbed DOM/canvas/PeerJS) - solo play, host/client netcode,
+  prediction, the lobby, rematch flow, and more. No install needed.
 - Developer / architecture guidance for editing the code lives in
   [`CLAUDE.md`](CLAUDE.md).
 
@@ -166,6 +178,9 @@ Three hand-designed, symmetric arenas (pick on the title screen):
 ├── manifest.webmanifest    # PWA manifest
 ├── sw.js                   # service worker (offline + auto-update)
 ├── icon-*.png              # PWA icons (regen: node tools/gen-icons.cjs)
+├── tools/
+│   ├── gen-icons.cjs       # regenerates the PWA icons
+│   └── smoke-test.cjs      # Node regression suite (see Tech notes)
 ├── reference.png           # original HUD/stage art mock-up (reference only)
 ├── CLAUDE.md               # contributor / code-structure notes
 └── README.md               # this file
@@ -177,9 +192,10 @@ Three hand-designed, symmetric arenas (pick on the title screen):
 
 - More weapon types and a charge/roller alternate fire.
 - Additional arenas and selectable difficulty.
-- Background music (also synthesized, no files).
-- Multiplayer polish: client-side prediction, a TURN fallback for strict NATs,
-  and in-lobby stage/weapon selection.
+- Team modes (e.g. 2v2) and an in-lobby map vote.
+- A TURN relay fallback for multiplayer players behind strict/symmetric NATs.
+- Lightweight matchmaking (e.g. a public "Quick Play" room) - the current lobby is
+  code-based/private only, by design.
 
 ---
 
