@@ -242,6 +242,15 @@ const rand  = (a, b) => a + Math.random() * (b - a);
 const randi = (a, b) => Math.floor(rand(a, b));
 const pick  = arr => arr[(Math.random() * arr.length) | 0];
 const TAU = Math.PI * 2;
+// easing (used by the result-screen reveal animation)
+const easeOutCubic = (t) => { t = clamp(t, 0, 1); return 1 - Math.pow(1 - t, 3); };
+const easeOutBack = (t) => {
+  t = clamp(t, 0, 1);
+  const c1 = 1.70158, c3 = c1 + 1;
+  return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2);
+};
+// 0..1 progress of a [start, start+dur] window against clock `t` (eased, monotonic)
+const revealAlpha = (t, start, dur) => easeOutCubic((t - start) / dur);
 
 // Seeded RNG for reproducible-ish map generation
 let _seed = 1337;
@@ -253,6 +262,11 @@ function shade(hex, amt) {
   if (amt > 0) { r = r + (255-r)*amt; g = g + (255-g)*amt; b = b + (255-b)*amt; }
   else { r = r * (1+amt); g = g * (1+amt); b = b * (1+amt); }
   return "rgb(" + (r|0) + "," + (g|0) + "," + (b|0) + ")";
+}
+// hex -> "rgba(r,g,b,a)" (used for glows/gradients that need transparency)
+function hexToRgba(hex, a) {
+  const r = parseInt(hex.slice(1,3),16), g = parseInt(hex.slice(3,5),16), b = parseInt(hex.slice(5,7),16);
+  return "rgba(" + r + "," + g + "," + b + "," + a + ")";
 }
 
 /* ============================================================
@@ -306,6 +320,18 @@ function sfx(kind) {
     case "go":     tone(520, 0.30, "square",  0.17, 1040); break;  // rising GO!
     case "ui":     tone(480, 0.06, "square",  0.06, 600); break;   // menu blip
     case "pickup": tone(523, 0.18, "sine",    0.13, 1047); tone(1047, 0.12, "triangle", 0.07, 1568); break; // happy chime
+    case "victory":   // triumphant rising 3-note fanfare
+      tone(523, 0.14, "square", 0.15, 660);
+      setTimeout(() => sfx("_v2"), 100);
+      setTimeout(() => sfx("_v3"), 200);
+      break;
+    case "_v2": tone(659, 0.14, "square", 0.15, 880); break;
+    case "_v3": tone(880, 0.32, "square", 0.17, 1175); noiseBurst(0.3, 0.1, 2200); break;
+    case "defeat":    // sagging descending tone
+      tone(300, 0.20, "sawtooth", 0.13, 190);
+      setTimeout(() => sfx("_d2"), 160);
+      break;
+    case "_d2": tone(210, 0.32, "sawtooth", 0.13, 110); break;
   }
 }
 
@@ -477,6 +503,7 @@ function menuTap(p) {
     case "HOWTO":
       game.state = "TITLE"; sfx("ui"); return;   // tap anywhere closes
     case "GAMEOVER": case "VICTORY":
+      if (!resultCanSkip()) return;   // let the reveal animation play out first
       if (net.role === "host") {
         if (inR(p, resultUI.rematch)) { sfx("ui"); netRematch(); }
         else if (inR(p, resultUI.leave)) { sfx("ui"); netReset(); game.state = "TITLE"; }
@@ -501,6 +528,7 @@ function handleEnter() {
   else if (game.state === "SETTINGS") game.state = settingsFrom;
   else if (game.state === "HOWTO" || game.state === "CREDITS") game.state = "TITLE";
   else if (game.state === "GAMEOVER" || game.state === "VICTORY") {
+    if (!resultCanSkip()) return;   // let the reveal animation play out first
     if (net.role === "host") netRematch();          // Enter = play again (host)
     else if (net.role === "client") { /* wait for host */ }
     else game.state = "TITLE";                       // solo
@@ -1982,7 +2010,8 @@ function hostSnap(dt) {
 }
 
 function update(dt) {
-  netConnectTick(dt);   // (client) join-handshake timeout, any state
+  netConnectTick(dt);    // (client) join-handshake timeout, any state
+  updateResultAnim(dt);  // advance the result-screen reveal, any role/state
 
   // CLIENT: never run the sim — interpolate snapshots + send input only
   if (net.role === "client") {
@@ -2029,6 +2058,33 @@ function update(dt) {
   hostSnap(dt);   // stream authoritative state to clients
 }
 
+/* ---- RESULT SCREEN REVEAL (Splatoon-style ink rain + bouncy stat reveal) ---- */
+// Timing knobs (seconds) the drawResult() animation reads against resultAnim.t.
+const RESULT_HOLD = 1.15;   // can't skip/tap through before this much has played
+let resultAnim = null;      // null = static/instant (e.g. state forced without endMatch)
+function startResultAnim(win) {
+  const drops = [];
+  const n = settings.perf ? 10 : 22;         // fewer ink drops in perf mode
+  for (let i = 0; i < n; i++) {
+    const fc = FACTION_COLORS[randi(0, 4)] || FACTION_COLORS[0];
+    // each drop is fully described by when it starts falling + how long the
+    // fall takes, so landing/splash timing can be derived purely from resultAnim.t
+    // (no per-frame mutation needed — see drawResultInkRain).
+    drops.push({ x: rand(0.03, 0.97), landYFrac: rand(0.68, 0.94), delay: rand(0, 0.9),
+      dur: rand(0.45, 0.85), size: rand(3.5, 8), color: fc.ink });
+  }
+  resultAnim = { t: 0, drops };
+  sfx(win ? "victory" : "defeat");
+}
+// advance the reveal clock; called every frame regardless of role (host/client/solo)
+function updateResultAnim(dt) {
+  if (game.state !== "VICTORY" && game.state !== "GAMEOVER") { resultAnim = null; return; }
+  if (!resultAnim) return;
+  resultAnim.t += dt;
+}
+// true once the reveal has played long enough to allow skipping / tapping buttons
+function resultCanSkip() { return !resultAnim || resultAnim.t >= RESULT_HOLD; }
+
 function endMatch() {
   const f = tallyTerritory();
   const tot = paintableTotal || 1;
@@ -2043,6 +2099,7 @@ function endMatch() {
     total: Math.round(game.pct.factions[localFaction] * 10) + player.kills * 100,
   };
   game.state = win ? "VICTORY" : "GAMEOVER";
+  startResultAnim(win);
   if (net.role === "host") netBroadcast({ t: "end", counts: f });
 }
 
@@ -2292,6 +2349,7 @@ function clientEndMatch(counts) {
     total: Math.round(game.pct.factions[localFaction] * 10) + (player.kills || 0) * 100,
   };
   game.state = win ? "VICTORY" : "GAMEOVER";
+  startResultAnim(win);
 }
 
 // ---------- SNAPSHOT (host build / client apply) ----------
@@ -4127,13 +4185,41 @@ function drawPause() {
   ctx.textAlign = "left";
 }
 
+// Screen-space ink rain behind the result panel. Every drop's fall + splash is a
+// pure function of resultAnim.t (delay/dur), so nothing needs to mutate per frame.
+function drawResultInkRain(anim) {
+  const S = ovScale(), t = anim.t;
+  for (const d of anim.drops) {
+    const fallT = t - d.delay;
+    if (fallT <= 0) continue;                    // hasn't started yet
+    const frac = fallT / d.dur;
+    const x = d.x * VIEW_W, landY = VIEW_H * d.landYFrac;
+    if (frac < 1) {
+      // falling: accelerating streak (gravity-ish ease-in)
+      const ease = frac * frac;
+      const y = lerp(-24 * S, landY, ease);
+      const len = (7 + frac * 9) * S;
+      ctx.globalAlpha = 0.85;
+      ctx.fillStyle = d.color;
+      ctx.fillRect(x - d.size * 0.35 * S, y, d.size * 0.7 * S, len);
+      ctx.globalAlpha = 1;
+    } else {
+      // landed: a quick fading splash ring + puddle
+      const age = (frac - 1) * d.dur;             // seconds since landing
+      if (age > 0.5) continue;
+      const a = 1 - age / 0.5, grow = 1 + age * 2.6;
+      ctx.globalAlpha = a * 0.55; ctx.fillStyle = d.color;
+      ctx.beginPath(); ctx.ellipse(x, landY, d.size * S * 0.6, d.size * S * 0.3, 0, 0, TAU); ctx.fill();
+      ctx.globalAlpha = a * 0.45; ctx.strokeStyle = d.color; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.ellipse(x, landY, d.size * S * grow, d.size * S * 0.5 * grow, 0, 0, TAU); ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+  }
+}
+
 function drawResult(win) {
   const S = ovScale(), cx = VIEW_W / 2;
-  ctx.fillStyle = "rgba(4,14,24,0.9)"; ctx.fillRect(0, 0, VIEW_W, VIEW_H);
-  const pw = Math.min(VIEW_W * 0.9, 380 * S), ph = Math.min(VIEW_H * 0.94, 404 * S);
-  const px0 = cx - pw / 2, py0 = VIEW_H / 2 - ph / 2;
-  hudPanel(px0, py0, pw, ph);
-  ctx.textAlign = "center";
+  const t = resultAnim ? resultAnim.t : 999;   // no anim (state forced) = fully revealed
   const r = game.result || { total: 0, killScore: 0, coverScore: 0 };
 
   // build the four-faction standings
@@ -4149,60 +4235,138 @@ function drawResult(win) {
   const rank = ranked.indexOf(meRow) + 1;
   const ord = ["1st", "2nd", "3rd", "4th"];
 
-  // title + placing
-  ctx.font = "bold " + Math.round(34 * S) + "px 'Trebuchet MS'";
-  ctx.fillStyle = win ? "#3dff8a" : "#ff6b6b";
-  ctx.fillText(win ? "VICTORY!" : "DEFEAT", cx, py0 + 34 * S);
-  ctx.font = "bold " + Math.round(11 * S) + "px monospace"; ctx.fillStyle = "#cfe9ff";
-  ctx.fillText(win ? ord[rank - 1] + " PLACE — you ruled the reef!" : ord[rank - 1] + " of 4 — out-inked this time", cx, py0 + 54 * S);
+  // reveal timeline (seconds) — panel bounces in, then content cascades on top
+  const T = { panel: 0.30, title: 0.14, titleDur: 0.30, sub: 0.32, bar: 0.42, barDur: 0.40,
+    rows: 0.56, rowStagger: 0.07, rowDur: 0.28, score: 0.95, scoreDur: 0.45, btn: RESULT_HOLD };
 
-  // four-faction segmented bar
+  // dark overlay, fades in fast
+  ctx.fillStyle = "rgba(4,14,24," + (0.9 * revealAlpha(t, 0, 0.18)).toFixed(3) + ")";
+  ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+
+  // winning ink color washes the screen behind everything, pulsing gently
+  if (!settings.perf) {
+    const panelCy = VIEW_H / 2;
+    const pulse = 0.5 + 0.5 * Math.sin(bgT * 2.2);
+    const gr = Math.max(VIEW_W, VIEW_H) * (0.55 + 0.07 * pulse) * revealAlpha(t, 0, 0.5);
+    const grd = ctx.createRadialGradient(cx, panelCy, 0, cx, panelCy, gr);
+    grd.addColorStop(0, hexToRgba(ranked[0].c, 0.15));
+    grd.addColorStop(1, hexToRgba(ranked[0].c, 0));
+    ctx.fillStyle = grd; ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+  }
+
+  // ink rain, falling behind the panel
+  if (resultAnim) drawResultInkRain(resultAnim);
+
+  const pw = Math.min(VIEW_W * 0.9, 380 * S), ph = Math.min(VIEW_H * 0.94, 404 * S);
+  const px0 = cx - pw / 2, py0 = VIEW_H / 2 - ph / 2;
+
+  // panel: bouncy "stamp" scale-in from its own center
+  const panelK = easeOutBack(t / T.panel);
+  if (panelK <= 0.001) return;   // nothing to draw yet
+  ctx.save();
+  ctx.translate(cx, py0 + ph / 2);
+  ctx.scale(clamp(panelK, 0, 1.3), clamp(panelK, 0, 1.3));
+  ctx.translate(-cx, -(py0 + ph / 2));
+  hudPanel(px0, py0, pw, ph);
+  ctx.restore();
+  ctx.textAlign = "center";
+
+  // title: soft ink splat stamp behind a bouncy pop-in
+  const titleK = easeOutBack((t - T.title) / T.titleDur);
+  if (titleK > 0.01) {
+    ctx.save();
+    ctx.globalAlpha = 0.35 * revealAlpha(t, T.title, T.titleDur);
+    ctx.fillStyle = win ? "#3dff8a" : "#ff6b6b";
+    const br = Math.min(titleK, 1.15);
+    ctx.beginPath(); ctx.ellipse(cx, py0 + 28 * S, 92 * S * br, 34 * S * br, 0, 0, TAU); ctx.fill();
+    ctx.restore();
+    ctx.save();
+    ctx.translate(cx, py0 + 34 * S);
+    ctx.scale(clamp(titleK, 0, 1.25), clamp(titleK, 0, 1.25));
+    ctx.font = "bold " + Math.round(34 * S) + "px 'Trebuchet MS'";
+    ctx.fillStyle = win ? "#3dff8a" : "#ff6b6b";
+    ctx.fillText(win ? "VICTORY!" : "DEFEAT", 0, 0);
+    ctx.restore();
+  }
+
+  // subtitle: fade + slide up into place
+  const subK = revealAlpha(t, T.sub, 0.3);
+  if (subK > 0.01) {
+    ctx.globalAlpha = subK;
+    ctx.font = "bold " + Math.round(11 * S) + "px monospace"; ctx.fillStyle = "#cfe9ff";
+    ctx.fillText(win ? ord[rank - 1] + " PLACE — you ruled the reef!" : ord[rank - 1] + " of 4 — out-inked this time",
+      cx, py0 + 54 * S + (1 - subK) * 8 * S);
+    ctx.globalAlpha = 1;
+  }
+
+  // four-faction segmented bar: ink sweeps in left-to-right
   const bx = px0 + pw * 0.1, by = py0 + 66 * S, bw = pw * 0.8, bh = 14 * S;
+  const barK = revealAlpha(t, T.bar, T.barDur);
   ctx.fillStyle = "#06202e"; rrect(bx, by, bw, bh);
-  let xo = bx;
-  for (const f of facs) { const w = bw * f.p / 100; if (w > 0.5) { ctx.fillStyle = f.c; rrect(xo, by, w, bh); } xo += w; }
+  if (barK > 0.01) {
+    ctx.save();
+    ctx.beginPath(); ctx.rect(bx, by, bw * barK, bh); ctx.clip();
+    let xo = bx;
+    for (const f of facs) { const w = bw * f.p / 100; if (w > 0.5) { ctx.fillStyle = f.c; rrect(xo, by, w, bh); } xo += w; }
+    ctx.restore();
+  }
   ctx.strokeStyle = "rgba(40,196,228,0.45)"; ctx.lineWidth = 1; ctx.strokeRect(Math.round(bx) + 0.5, Math.round(by) + 0.5, Math.round(bw), Math.round(bh));
 
-  // ranked standings list
+  // ranked standings list: rows cascade in from the right, staggered by rank
   const yy = py0 + 96 * S, rh = Math.min(26 * S, (ph * 0.42) / 4);
   ctx.font = "bold " + Math.round(12 * S) + "px monospace"; ctx.textBaseline = "middle";
   for (let i = 0; i < ranked.length; i++) {
-    const f = ranked[i], rowY = yy + i * rh + rh / 2;
+    const rowK = revealAlpha(t, T.rows + i * T.rowStagger, T.rowDur);
+    if (rowK <= 0.01) continue;
+    const f = ranked[i], rowY = yy + i * rh + rh / 2, dx = (1 - rowK) * 36 * S;
+    ctx.globalAlpha = rowK;
     if (f.me) { ctx.fillStyle = "rgba(44,202,218,0.12)"; rrect(bx - 4 * S, rowY - rh / 2, bw + 8 * S, rh); }
-    ctx.textAlign = "left"; ctx.fillStyle = f.me ? "#eaffff" : "#8fb4c6"; ctx.fillText((i + 1) + ".", bx, rowY);
-    ctx.fillStyle = f.c; rrect(bx + 20 * S, rowY - 5 * S, 10 * S, 10 * S);
-    ctx.fillStyle = f.me ? "#eaffff" : "#cfe9ff"; ctx.fillText(f.n, bx + 36 * S, rowY);
-    ctx.textAlign = "right"; ctx.fillStyle = f.c; ctx.fillText(Math.round(f.p) + "%", bx + bw, rowY);
+    ctx.textAlign = "left"; ctx.fillStyle = f.me ? "#eaffff" : "#8fb4c6"; ctx.fillText((i + 1) + ".", bx + dx, rowY);
+    ctx.fillStyle = f.c; rrect(bx + 20 * S + dx, rowY - 5 * S, 10 * S, 10 * S);
+    ctx.fillStyle = f.me ? "#eaffff" : "#cfe9ff"; ctx.fillText(f.n, bx + 36 * S + dx, rowY);
+    ctx.textAlign = "right"; ctx.fillStyle = f.c; ctx.fillText(Math.round(f.p) + "%", bx + bw + dx, rowY);
+    ctx.globalAlpha = 1;
   }
   ctx.textBaseline = "alphabetic";
 
-  // score breakdown
-  const sy = yy + 4 * rh + 22 * S;
-  ctx.textAlign = "center"; ctx.fillStyle = "#9cc7da"; ctx.font = Math.round(11 * S) + "px monospace";
-  ctx.fillText("Coverage " + r.coverScore + "    ·    Splats x" + player.kills + "  " + r.killScore, cx, sy);
-  ctx.fillStyle = PLAYER_COLOR; ctx.font = "bold " + Math.round(18 * S) + "px monospace";
-  ctx.fillText("TOTAL  " + r.total, cx, sy + 24 * S);
+  // score breakdown: numbers count up
+  const scoreK = revealAlpha(t, T.score, T.scoreDur);
+  if (scoreK > 0.01) {
+    const sy = yy + 4 * rh + 22 * S;
+    ctx.globalAlpha = Math.min(1, scoreK * 3);   // pop in fast, then finish counting
+    ctx.textAlign = "center"; ctx.fillStyle = "#9cc7da"; ctx.font = Math.round(11 * S) + "px monospace";
+    ctx.fillText("Coverage " + Math.round(r.coverScore * scoreK) + "    ·    Splats x" + Math.round(player.kills * scoreK) + "  " + Math.round(r.killScore * scoreK), cx, sy);
+    ctx.fillStyle = PLAYER_COLOR; ctx.font = "bold " + Math.round(18 * S) + "px monospace";
+    ctx.fillText("TOTAL  " + Math.round(r.total * scoreK), cx, sy + 24 * S);
+    ctx.globalAlpha = 1;
+  }
 
-  // bottom: multiplayer rematch controls, or solo "tap for title" prompt
-  if (net.role) {
-    const bw = pw * 0.40, bh = 30 * S, gap = pw * 0.04, byy = py0 + ph - 40 * S;
+  // bottom: multiplayer rematch controls, or solo "tap for title" prompt —
+  // fades in exactly when the reveal unlocks skipping (resultCanSkip())
+  const btnK = revealAlpha(t, T.btn, 0.3);
+  if (btnK <= 0.01) {
+    resultUI.rematch = resultUI.leave = null;
+  } else if (net.role) {
+    ctx.globalAlpha = btnK;
+    const bw2 = pw * 0.40, bh2 = 30 * S, gap = pw * 0.04, byy = py0 + ph - 40 * S;
     if (net.role === "host") {
-      resultUI.rematch = { x: cx - bw - gap / 2, y: byy, w: bw, h: bh };
+      resultUI.rematch = { x: cx - bw2 - gap / 2, y: byy, w: bw2, h: bh2 };
       drawBtn(resultUI.rematch, "PLAY AGAIN", PLAYER_COLOR, true, 13 * S);
-      resultUI.leave = { x: cx + gap / 2, y: byy, w: bw, h: bh };
+      resultUI.leave = { x: cx + gap / 2, y: byy, w: bw2, h: bh2 };
       drawBtn(resultUI.leave, "LEAVE", "#e2724f", false, 12 * S);
     } else {
-      ctx.globalAlpha = 0.5 + 0.5 * Math.sin(bgT * 6);
+      ctx.globalAlpha = btnK * (0.5 + 0.5 * Math.sin(bgT * 6));
       ctx.fillStyle = "#9cc7da"; ctx.font = Math.round(10 * S) + "px monospace";
       ctx.fillText("Waiting for host to start a rematch…", cx, byy - 6 * S);
-      ctx.globalAlpha = 1;
+      ctx.globalAlpha = btnK;
       resultUI.rematch = null;
-      resultUI.leave = { x: cx - bw / 2, y: byy, w: bw, h: bh };
+      resultUI.leave = { x: cx - bw2 / 2, y: byy, w: bw2, h: bh2 };
       drawBtn(resultUI.leave, "LEAVE", "#e2724f", false, 12 * S);
     }
+    ctx.globalAlpha = 1;
   } else {
     resultUI.rematch = resultUI.leave = null;
-    ctx.globalAlpha = 0.5 + 0.5 * Math.sin(bgT * 6);
+    ctx.globalAlpha = btnK * (0.5 + 0.5 * Math.sin(bgT * 6));
     ctx.fillStyle = "#fff"; ctx.font = "bold " + Math.round(12 * S) + "px monospace";
     ctx.fillText(isTouch ? "TAP for title" : "CLICK or ENTER for title", cx, py0 + ph - 10 * S);
     ctx.globalAlpha = 1;
